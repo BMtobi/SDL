@@ -1,0 +1,32 @@
+# Binaries
+ffmpeg.exe
+withny-dl-windows-amd64.exe
+
+# Configuration files containing credentials/webhooks
+settings.json
+channels.json
+credentials.yaml
+master_config.yaml
+withny-master-token.json
+history.json
+cookies.txt
+fc2_cookies.txt
+mychannels.txt
+channels.txt
+*.bak
+
+# Caches and builds
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+
+# Downloaded files and partials
+*.part
+*.ytdl
+*.ts
+*.mp4
+*.mkv
+*.webm
+*.log
