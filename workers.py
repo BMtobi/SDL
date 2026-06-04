@@ -49,6 +49,7 @@ def get_yt_live_metadata(url):
 def worker_manual_download(app, uid, url, custom_path, platform, quality="best", fmt="best"):
     env = os.environ.copy()
     env["PATH"] = BASE_DIR + os.pathsep + env.get("PATH", "")
+    env["PYTHONPATH"] = BASE_DIR + os.pathsep + env.get("PYTHONPATH", "")
     
     display_name = url
     if len(display_name) > 40:
@@ -253,6 +254,7 @@ def worker_manual_download(app, uid, url, custom_path, platform, quality="best",
 def worker_rplay(app, target):
     env = os.environ.copy()
     env["PATH"] = BASE_DIR + os.pathsep + env.get("PATH", "")
+    env["PYTHONPATH"] = BASE_DIR + os.pathsep + env.get("PYTHONPATH", "")
     
     uid, name, url, do_record, img_url = target['uid'], target['name'], target['url'], target['record'], target['image']
     safe_name = sanitize_filename(name)
@@ -331,12 +333,16 @@ def worker_rplay(app, target):
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', env=env, cwd=output_dir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
                 app.active_tasks[uid]["process"] = proc
                 
+                output_lines = []
                 while app.is_monitoring:
                     line = proc.stdout.readline()
                     if not line and proc.poll() is not None:
                         break
                     if line:
                         line = line.strip()
+                        output_lines.append(line)
+                        if len(output_lines) > 20:
+                            output_lines.pop(0)
                         if "[download]" in line and "%" in line:
                             match = re.search(r'(\d+\.\d+)%', line)
                             if match:
@@ -358,6 +364,8 @@ def worker_rplay(app, target):
                 if duration < 15:
                     consecutive_fails += 1
                     app.add_log(f"⚠️ {safe_name} 錄影異常秒斷 (僅 {int(duration)} 秒) [{consecutive_fails}/3]", "WARNING")
+                    for ol in output_lines[-5:]:
+                        app.add_log(f"  [yt-dlp] {ol}", "ERROR")
                 else:
                     consecutive_fails = 0
                     
@@ -382,6 +390,7 @@ def worker_rplay(app, target):
 def worker_youtube(app, target):
     env = os.environ.copy()
     env["PATH"] = BASE_DIR + os.pathsep + env.get("PATH", "")
+    env["PYTHONPATH"] = BASE_DIR + os.pathsep + env.get("PYTHONPATH", "")
     
     uid, name, url, do_record, img_url = target['uid'], target['name'], target['url'], target['record'], target['image']
     safe_name = sanitize_filename(name)
@@ -495,6 +504,7 @@ def worker_youtube(app, target):
 def worker_withny_master(app, targets_map):
     env = os.environ.copy()
     env["PATH"] = BASE_DIR + os.pathsep + env.get("PATH", "")
+    env["PYTHONPATH"] = BASE_DIR + os.pathsep + env.get("PYTHONPATH", "")
     
     exe_name = "withny-dl-windows-amd64.exe"
     exe_path = get_binary_path(exe_name)
@@ -675,6 +685,7 @@ def worker_withny_notify(app, target):
 def worker_fc2(app, target):
     env = os.environ.copy()
     env["PATH"] = BASE_DIR + os.pathsep + env.get("PATH", "")
+    env["PYTHONPATH"] = BASE_DIR + os.pathsep + env.get("PYTHONPATH", "")
     
     uid, name, url, do_record, img_url = target['uid'], target['name'], target['url'], target['record'], target['image']
     safe_name = sanitize_filename(name)
