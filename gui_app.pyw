@@ -599,8 +599,15 @@ class App(ctk.CTk):
             # Determine channel active status
             channel_state = "Offline"
             for utask in self.active_tasks.values():
-                if utask.get("channel_name") == channel["name"]:
+                # Match by URL first, then fallback to name
+                task_url = utask.get("channel_url") or utask.get("url")
+                if task_url:
+                    if task_url == channel["url"]:
+                        channel_state = utask.get("status", "Offline")
+                        break
+                elif utask.get("channel_name") == channel["name"]:
                     channel_state = utask.get("status", "Offline")
+                    break
             
             is_active_download = channel_state in ["錄影中", "下載中", "準備錄影", "解析連線中..."]
             
@@ -652,6 +659,10 @@ class App(ctk.CTk):
                 rec_text = f"🔴 {channel_state}"
                 rec_color = self.c_red
                 rec_bg = self.c_red_bg
+            elif "監控中" in channel_state:
+                rec_text = f"🟢 {channel_state}"
+                rec_color = self.c_green
+                rec_bg = self.c_green_bg
             else:
                 rec_text = "REC ON" if channel["record"] else "NOTIFY"
                 rec_color = self.c_red if channel["record"] else self.c_blue

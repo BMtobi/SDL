@@ -58,6 +58,7 @@ def worker_manual_download(app, uid, url, custom_path, platform, quality="best",
     app.active_tasks[uid] = {
         "channel_name": f"[手動] {display_name}",
         "platform": platform,
+        "channel_url": url,
         "status": "佇列中",
         "progress": 0.0,
         "speed": "",
@@ -295,6 +296,7 @@ def worker_rplay(app, target):
             app.active_tasks[uid] = {
                 "channel_name": safe_name,
                 "platform": "Rplay",
+                "channel_url": url,
                 "status": "準備錄影",
                 "progress": 0.0,
                 "speed": "",
@@ -432,6 +434,7 @@ def worker_youtube(app, target):
                             app.active_tasks[uid] = {
                                 "channel_name": safe_name,
                                 "platform": "YouTube",
+                                "channel_url": url,
                                 "status": "錄影中",
                                 "progress": -1, # indeterminate
                                 "speed": "",
@@ -564,6 +567,7 @@ channels:
                     app.active_tasks[uid] = {
                         "channel_name": info["name"],
                         "platform": "Withny",
+                        "channel_url": info["url"],
                         "status": "監控中",
                         "progress": -1,
                         "speed": "",
@@ -669,6 +673,7 @@ def worker_withny_notify(app, target):
     app.active_tasks[uid] = {
         "channel_name": target["name"],
         "platform": "Withny",
+        "channel_url": target["url"],
         "status": "監控中(僅通知)",
         "progress": -1,
         "speed": "",
@@ -712,6 +717,7 @@ def worker_fc2(app, target):
         app.active_tasks[uid] = {
             "channel_name": safe_name,
             "platform": "FC2",
+            "channel_url": url,
             "status": "監控中",
             "progress": -1,
             "speed": "",
