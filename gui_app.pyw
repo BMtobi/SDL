@@ -1783,7 +1783,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(scroll_settings, text="Withny 影音格式轉換 (Remux):", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=25, pady=8, sticky="w")
         self.withny_remux_var = ctk.BooleanVar()
         self.withny_remux_switch = ctk.CTkSwitch(
-            scroll_settings, text="啟用 TS 格式自動重封裝 (推薦)", variable=self.withny_remux_var,
+            scroll_settings, text="啟用即時重封裝 (不推薦，建議使用 Concat 代替)", variable=self.withny_remux_var,
             text_color=self.c_text_primary, progress_color=self.c_accent, button_color=self.c_text_primary, button_hover_color=self.c_accent_hover,
             command=self.on_settings_modified
         )
@@ -1810,7 +1810,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(scroll_settings, text="Withny 合併連續分段 (Concat):", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=25, pady=8, sticky="w")
         self.withny_concat_var = ctk.BooleanVar()
         self.withny_concat_switch = ctk.CTkSwitch(
-            scroll_settings, text="自動合併多段 TS 串流檔", variable=self.withny_concat_var,
+            scroll_settings, text="自動合併並重封裝為目標格式 (推薦，能防止損壞)", variable=self.withny_concat_var,
             text_color=self.c_text_primary, progress_color=self.c_accent, button_color=self.c_text_primary, button_hover_color=self.c_accent_hover,
             command=self.on_settings_modified
         )

@@ -535,6 +535,7 @@ defaultParams:
   remuxFormat: '{app.settings["withny_remux_format"]}'
   concat: {str(app.settings["withny_concat"]).lower()}
   keepIntermediates: {str(app.settings["withny_keep_intermediates"]).lower()}
+  deleteCorrupted: true
   waitPollInterval: '{app.settings["withny_wait_poll_interval"]}'
 
 rateLimitAvoidance:
