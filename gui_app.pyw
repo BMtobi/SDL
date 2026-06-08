@@ -4,6 +4,7 @@ import queue
 import time
 import tempfile
 import threading
+import subprocess
 from datetime import datetime
 
 # Import modular project components
@@ -183,6 +184,14 @@ class App(ctk.CTk):
         
         # Load configs
         self.load_all_configs()
+        
+        # Cleanup leftover temp files in the download directory on startup
+        try:
+            from utils import clean_dir_leftovers
+            if self.settings.get("download_dir"):
+                clean_dir_leftovers(self.settings["download_dir"])
+        except Exception as e:
+            self.add_log(f"啟動時清理暫存檔失敗: {e}", "WARNING")
         
         # Build UI layout
         self.build_ui()
@@ -655,18 +664,18 @@ class App(ctk.CTk):
             
             # Determine badge colors and text
             plat_color, plat_bg = self.platform_colors.get(platform, (self.c_text_secondary, self.c_card))
-            if is_active_download:
+            if channel_state in ["錄影中", "下載中"]:
                 rec_text = f"🔴 {channel_state}"
                 rec_color = self.c_red
                 rec_bg = self.c_red_bg
-            elif "監控中" in channel_state:
+            elif is_active_download or "監控中" in channel_state:
                 rec_text = f"🟢 {channel_state}"
                 rec_color = self.c_green
                 rec_bg = self.c_green_bg
             else:
                 rec_text = "REC ON" if channel["record"] else "NOTIFY"
-                rec_color = self.c_red if channel["record"] else self.c_blue
-                rec_bg = self.c_red_bg if channel["record"] else self.c_blue_bg
+                rec_color = self.c_green
+                rec_bg = self.c_green_bg
                 
             card_fg = self.c_card_selected if idx_in_channels == self.selected_channel_index else self.c_card
             card_border = self.c_accent if idx_in_channels == self.selected_channel_index else self.c_card_border
@@ -685,7 +694,7 @@ class App(ctk.CTk):
                 card_info["url_label"].configure(text=url_subtitle, bg=card_fg)
                 
                 card_info["plat_badge"].configure(text=platform.upper(), bg=plat_bg, fg=plat_color)
-                card_info["rec_badge"].configure(text=rec_text, bg=rec_bg, fg=rec_color, width=12 if is_active_download else 9)
+                card_info["rec_badge"].configure(text=rec_text, bg=rec_bg, fg=rec_color, width=16 if (is_active_download or "監控中" in channel_state) else 9)
                 
                 card_info["thumb_container"].configure(bg=self.c_sidebar)
                 
@@ -785,7 +794,7 @@ class App(ctk.CTk):
                     bg=rec_bg,
                     fg=rec_color, 
                     font=("Microsoft JhengHei", 8, "bold"),
-                    width=12 if is_active_download else 9,
+                    width=16 if (is_active_download or "監控中" in channel_state) else 9,
                     height=1,
                     relief="flat"
                 )
@@ -1161,7 +1170,8 @@ class App(ctk.CTk):
             proc = task.get("process")
             if proc:
                 try:
-                    proc.kill()
+                    from utils import kill_process_tree
+                    kill_process_tree(proc)
                     self.add_log(f"已手動強制終止任務: {task['channel_name']}", "WARNING")
                 except Exception as e:
                     self.add_log(f"終止任務子程序出錯: {e}", "ERROR")
@@ -1572,11 +1582,11 @@ class App(ctk.CTk):
         self.ua_entry.bind("<KeyRelease>", self.on_settings_modified)
         row_idx += 1
         
-        # 下載不休眠設定
-        ctk.CTkLabel(scroll_settings, text="下載不休眠設定:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=25, pady=8, sticky="w")
+        # 下載防睡眠設定
+        ctk.CTkLabel(scroll_settings, text="下載防睡眠設定:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=25, pady=8, sticky="w")
         self.prevent_sleep_menu = ctk.CTkOptionMenu(
             scroll_settings,
-            values=["下載時不休眠", "不休眠", "休眠"],
+            values=["下載/監控時阻擋睡眠", "完全阻擋睡眠", "恢復系統預設"],
             fg_color=self.c_sidebar,
             button_color=self.c_accent,
             button_hover_color=self.c_accent_hover,
@@ -2088,7 +2098,14 @@ class App(ctk.CTk):
         self.ua_entry.delete(0, "end")
         self.ua_entry.insert(0, self.settings.get("user_agent", ""))
         
-        self.prevent_sleep_menu.set(self.settings.get("prevent_sleep_mode", "下載時不休眠"))
+        old_val = self.settings.get("prevent_sleep_mode", "下載/監控時阻擋睡眠")
+        if old_val in ["下載時不休眠", "下載/監控時阻擋休眠"]:
+            old_val = "下載/監控時阻擋睡眠"
+        elif old_val in ["不休眠", "完全阻擋休眠"]:
+            old_val = "完全阻擋睡眠"
+        elif old_val in ["休眠", "恢復系統預設"]:
+            old_val = "恢復系統預設"
+        self.prevent_sleep_menu.set(old_val)
 
     # ================= Logs Tab =================
     def build_logs_tab(self):
@@ -2443,21 +2460,24 @@ class App(ctk.CTk):
 
     # ================= Sleep Prevention & Cleanups =================
     def update_sleep_prevention_state(self):
-        mode = self.settings.get("prevent_sleep_mode", "下載時不休眠")
+        mode = self.settings.get("prevent_sleep_mode", "下載/監控時阻擋睡眠")
         
         has_active_downloads = False
-        if mode == "下載時不休眠":
-            for task in self.active_tasks.values():
-                if task.get("process") and task["process"].poll() is None:
-                    has_active_downloads = True
-                    break
+        if mode in ["下載/監控時阻擋睡眠", "下載/監控時阻擋休眠", "下載時不休眠"]:
+            if self.is_monitoring:
+                has_active_downloads = True
+            else:
+                for task in self.active_tasks.values():
+                    if task.get("process") and task["process"].poll() is None:
+                        has_active_downloads = True
+                        break
         
         target_prevent = False
-        if mode == "不休眠":
+        if mode in ["完全阻擋睡眠", "完全阻擋休眠", "不休眠"]:
             target_prevent = True
-        elif mode == "下載時不休眠":
+        elif mode in ["下載/監控時阻擋睡眠", "下載/監控時阻擋休眠", "下載時不休眠"]:
             target_prevent = has_active_downloads
-        else: # "休眠"
+        else: # "恢復系統預設" / "休眠"
             target_prevent = False
             
         current_prevent = getattr(self, "sleep_prevented_active", None)
@@ -2472,8 +2492,10 @@ class App(ctk.CTk):
         if sys.platform == "win32":
             try:
                 import ctypes
-                ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)
-                self.add_log("防睡眠機制已啟用 (阻斷電腦自動休眠)", "SUCCESS")
+                # Prevent both System Sleep (0x00000001) and Display Sleep (0x00000002) in continuous mode (0x80000000)
+                # This is critical on Windows 10/11 with Modern Standby (S0) to keep the downloader thread active.
+                ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001 | 0x00000002)
+                self.add_log("防睡眠機制已啟用 (阻斷電腦自動睡眠與螢幕關閉)", "SUCCESS")
             except Exception as e:
                 self.add_log(f"防睡眠機制啟用失敗: {e}", "WARNING")
 
@@ -2482,7 +2504,7 @@ class App(ctk.CTk):
             try:
                 import ctypes
                 ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
-                self.add_log("防睡眠機制已解除 (恢復系統休眠設定)", "INFO")
+                self.add_log("防睡眠機制已解除 (恢復系統休眠與螢幕設定)", "INFO")
             except:
                 pass
 
@@ -2651,8 +2673,25 @@ class App(ctk.CTk):
         self.monitor_btn.configure(text="▶️ 啟動監控", fg_color=self.c_accent, hover_color=self.c_accent_hover)
         self.add_log("停止監控中，正在重置連線與子程序...", "WARNING")
         
+        # Kill all active task processes
+        from utils import kill_process_tree, clean_dir_leftovers
+        for uid, task in list(self.active_tasks.items()):
+            proc = task.get("process")
+            if proc:
+                try:
+                    kill_process_tree(proc)
+                except Exception as e:
+                    self.add_log(f"終止監控任務 [{task.get('channel_name')}] 子程序出錯: {e}", "ERROR")
+                    
         self.cleanup_temp_files()
         
+        # Clean up leftover temp files in the download directory
+        try:
+            if self.settings.get("download_dir"):
+                clean_dir_leftovers(self.settings["download_dir"])
+        except Exception as e:
+            self.add_log(f"停止監控時清理暫存檔失敗: {e}", "WARNING")
+            
         self.active_tasks.clear()
         self.gui_update_queue.put(("refresh_tasks", None))
         self.gui_update_queue.put(("refresh_channels_list", None))
@@ -2692,8 +2731,8 @@ class App(ctk.CTk):
                 try:
                     mtime = os.path.getmtime(file_path)
                     if mtime > start_time and mtime > newest_mtime:
-                        # Exclude temporary intermediate TS files
-                        if not file.endswith(".part") and not file.endswith(".ytdl") and not file.endswith(".ts"):
+                        # Exclude temporary intermediate TS files and temp mp4/mkv merge files
+                        if not file.endswith(".part") and not file.endswith(".ytdl") and not file.endswith(".ts") and not file.endswith(".temp.mp4") and not file.endswith(".temp.mkv"):
                             newest_file = file_path
                             newest_mtime = mtime
                 except:

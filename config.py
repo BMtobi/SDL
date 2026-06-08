@@ -1,21 +1,21 @@
 import os
 
-CONFIG_FILE = "channels.json"
-SETTINGS_FILE = "settings.json"
-CREDENTIALS_FILE = "credentials.yaml"
-CACHE_FILE = "withny-master-token.json"
-HISTORY_FILE = "history.json"
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__)).replace("\\", "/")
+
+CONFIG_FILE = os.path.join(BASE_DIR, "channels.json").replace("\\", "/")
+SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json").replace("\\", "/")
+CREDENTIALS_FILE = os.path.join(BASE_DIR, "credentials.yaml").replace("\\", "/")
+CACHE_FILE = os.path.join(BASE_DIR, "withny-master-token.json").replace("\\", "/")
+HISTORY_FILE = os.path.join(BASE_DIR, "history.json").replace("\\", "/")
 
 DEFAULT_SETTINGS = {
     "download_dir": BASE_DIR,
     "prevent_sleep_mode": "下載時不休眠",
-    "rplay_token": "",
+    "rplay_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJlbWwiOiJibWFwbGU3MzBAZ21haWwuY29tIiwiZGF0IjoiMjAyNi0wMy0xM1QxNDo0NzoyNC4yMjVaIiwiaWF0IjoxNzczNDEzMjQ0fQ.WUmYjEoyLjgGcSRGp_TB2ruKGFiFock8dFLkDayQqQ8",
     "rplay_username": "",
     "rplay_password": "",
     "withny_token": "",
-    "discord_webhook": "",
+    "discord_webhook": "https://discord.com/api/webhooks/1454404890137722971/5arguvFCLMhnmsR_rFo-Egq-m0wKkjwxKDAdj-aN-l1FzZOK_XMTiW_mDKN2Rojvwk4V",
     "cookies_file": "cookies.txt",
     "fc2_cookies_file": "fc2_cookies.txt",
     "yt_quality": "best",

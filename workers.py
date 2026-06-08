@@ -5,7 +5,7 @@ import time
 import subprocess
 import shutil
 from config import BASE_DIR, CREDENTIALS_FILE, CACHE_FILE
-from utils import LazyModule, sanitize_filename, strip_ansi, get_binary_path
+from utils import LazyModule, sanitize_filename, strip_ansi, get_binary_path, kill_process_tree, clean_dir_leftovers
 
 # Lazy load heavy dependencies
 requests = LazyModule("requests")
@@ -246,6 +246,11 @@ def worker_manual_download(app, uid, url, custom_path, platform, quality="best",
         else:
             app.add_log(f"手動單獨下載失敗 (錯誤代碼: {returncode})", "ERROR")
             
+        try:
+            clean_dir_leftovers(output_dir)
+        except:
+            pass
+            
     except Exception as e:
         app.add_log(f"手動單獨下載出錯: {e}", "ERROR")
         
@@ -360,8 +365,16 @@ def worker_rplay(app, target):
                         elapsed_sec = int(time.time() - start_time)
                         app.active_tasks[uid]["elapsed"] = f"{elapsed_sec // 60:02d}:{elapsed_sec % 60:02d}"
                         
+                if not app.is_monitoring and proc.poll() is None:
+                    kill_process_tree(proc)
+                    
                 duration = time.time() - start_time
                 ret_code = proc.wait()
+                
+                try:
+                    clean_dir_leftovers(output_dir)
+                except Exception as cle:
+                    app.add_log(f"清理 Rplay 暫存檔失敗: {cle}", "WARNING")
                 
                 if duration < 15:
                     consecutive_fails += 1
@@ -476,7 +489,14 @@ def worker_youtube(app, target):
                                         elapsed_sec = int(time.time() - start_time)
                                         app.active_tasks[uid]["elapsed"] = f"{elapsed_sec // 60:02d}:{elapsed_sec % 60:02d}"
                                         
+                                if not app.is_monitoring and proc.poll() is None:
+                                    kill_process_tree(proc)
                                 proc.wait()
+                                
+                                try:
+                                    clean_dir_leftovers(output_dir)
+                                except:
+                                    pass
                                 
                                 app.add_log(f"{safe_name} YT 錄影結束", "WARNING")
                                 app.send_discord_notify(f"https://youtu.be/{v_id}", "YT 錄影完成", name, "YouTube", include_url=False)
@@ -661,7 +681,14 @@ channels:
                     except Exception as inner_ex:
                         print(f"Error parsing Withny line: {inner_ex}")
                         
+            if not app.is_monitoring and proc.poll() is None:
+                kill_process_tree(proc)
             proc.wait()
+            
+            try:
+                clean_dir_leftovers(app.settings["download_dir"])
+            except:
+                pass
             app.add_log("Withny 監控核心程式已退出，將於 5 秒後重啟...", "WARNING")
             time.sleep(5)
             
@@ -768,7 +795,14 @@ def worker_fc2(app, target):
                     elapsed_sec = int(time.time() - start_time)
                     app.active_tasks[uid]["elapsed"] = f"{elapsed_sec // 60:02d}:{elapsed_sec % 60:02d}"
                     
+            if not app.is_monitoring and proc.poll() is None:
+                kill_process_tree(proc)
             proc.wait()
+            
+            try:
+                clean_dir_leftovers(output_dir)
+            except:
+                pass
             
             if has_notified:
                 app.add_log(f"{safe_name} FC2 錄影結束", "WARNING")

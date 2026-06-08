@@ -104,3 +104,72 @@ def get_binary_path(name):
     if os.path.exists(p):
         return p
     return name
+
+def kill_process_tree(proc):
+    if not proc:
+        return
+    import subprocess
+    if sys.platform == "win32":
+        try:
+            # Use taskkill to kill the process tree (/T) forcefully (/F) by PID
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+        except Exception as e:
+            print(f"Failed to kill process tree: {e}")
+            try:
+                proc.kill()
+            except:
+                pass
+    else:
+        try:
+            proc.kill()
+        except:
+            pass
+
+def clean_dir_leftovers(download_dir):
+    if not download_dir or not os.path.exists(download_dir):
+        return
+    for root, _, files in os.walk(download_dir):
+        for file in files:
+            file_path = os.path.join(root, file).replace("\\", "/")
+            try:
+                if file.endswith(".temp.mp4"):
+                    base = file_path[:-9]
+                    if os.path.exists(base + ".mp4") or os.path.exists(base + ".mkv") or os.path.exists(base + ".ts"):
+                        os.remove(file_path)
+                elif file.endswith(".temp.mkv"):
+                    base = file_path[:-9]
+                    if os.path.exists(base + ".mp4") or os.path.exists(base + ".mkv") or os.path.exists(base + ".ts"):
+                        os.remove(file_path)
+                elif file.endswith(".part"):
+                    if file.endswith(".mp4.part"):
+                        base_mp4 = file_path[:-5]
+                        if os.path.exists(base_mp4):
+                            os.remove(file_path)
+                    elif file.endswith(".mkv.part"):
+                        base_mkv = file_path[:-5]
+                        if os.path.exists(base_mkv):
+                            os.remove(file_path)
+                    else:
+                        base = file_path[:-5]
+                        if os.path.exists(base + ".mp4") or os.path.exists(base + ".mkv") or os.path.exists(base + ".ts"):
+                            os.remove(file_path)
+                elif file.endswith(".ytdl"):
+                    if file.endswith(".mp4.ytdl"):
+                        base_mp4 = file_path[:-5]
+                        if os.path.exists(base_mp4):
+                            os.remove(file_path)
+                    elif file.endswith(".mkv.ytdl"):
+                        base_mkv = file_path[:-5]
+                        if os.path.exists(base_mkv):
+                            os.remove(file_path)
+                    else:
+                        base = file_path[:-5]
+                        if os.path.exists(base + ".mp4") or os.path.exists(base + ".mkv") or os.path.exists(base + ".ts"):
+                            os.remove(file_path)
+                elif file.endswith(".ts"):
+                    base = file_path[:-3]
+                    if os.path.exists(base + ".mp4") or os.path.exists(base + ".mkv"):
+                        os.remove(file_path)
+            except Exception as e:
+                print(f"Error cleaning file {file_path}: {e}")
+
