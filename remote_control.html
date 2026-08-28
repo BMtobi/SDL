@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>StreamBot 遠端控制台</title>
+  <link rel="apple-touch-icon" href="https://rplay.live/favicon.ico">
+  <style>
+    :root {
+      --bg: #11111b;
+      --card-bg: #1e1e2e;
+      --card-border: #313244;
+      --text-primary: #cdd6f4;
+      --text-secondary: #a6adc8;
+      --accent: #89b4fa;
+      --accent-hover: #b4befe;
+      --success: #a6e3a1;
+      --danger: #f38ba8;
+      --warning: #f9e2af;
+      --purple: #cba6f7;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    body {
+      background-color: var(--bg);
+      color: var(--text-primary);
+      padding: 12px;
+      max-width: 600px;
+      margin: 0 auto;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px 16px;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+    }
+
+    .logo {
+      font-size: 16px;
+      font-weight: bold;
+      color: var(--accent);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .status-badge {
+      font-size: 12px;
+      padding: 4px 10px;
+      border-radius: 20px;
+      font-weight: bold;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .status-badge.online { background: rgba(166, 227, 161, 0.15); color: var(--success); }
+    .status-badge.offline { background: rgba(243, 139, 168, 0.15); color: var(--danger); }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .card-title {
+      font-size: 14px;
+      font-weight: bold;
+      color: var(--text-secondary);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .host-input-group {
+      display: flex;
+      gap: 8px;
+    }
+
+    input, select {
+      flex: 1;
+      padding: 10px 14px;
+      background: #181825;
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      color: var(--text-primary);
+      font-size: 14px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    input:focus, select:focus {
+      border-color: var(--accent);
+    }
+
+    button {
+      padding: 10px 16px;
+      border: none;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: bold;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      transition: background 0.2s, opacity 0.2s;
+    }
+    button:active {
+      opacity: 0.8;
+    }
+
+    .btn-primary { background: var(--accent); color: #11111b; }
+    .btn-success { background: var(--success); color: #11111b; }
+    .btn-danger { background: var(--danger); color: #11111b; }
+    .btn-purple { background: var(--purple); color: #11111b; }
+
+    .control-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .monitor-info {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .nav-tabs {
+      display: flex;
+      gap: 6px;
+      background: var(--card-bg);
+      padding: 4px;
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+    }
+
+    .tab-btn {
+      flex: 1;
+      padding: 8px 12px;
+      background: transparent;
+      color: var(--text-secondary);
+      border-radius: 6px;
+      font-size: 13px;
+    }
+    .tab-btn.active {
+      background: var(--accent);
+      color: #11111b;
+      font-weight: bold;
+    }
+
+    .tab-content {
+      display: none;
+    }
+    .tab-content.active {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .task-card {
+      background: #181825;
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .task-header {
+      display: flex;
+      justify-content: space-between;
+      font-weight: bold;
+      font-size: 14px;
+    }
+
+    .task-meta {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
+    .progress-bar-bg {
+      height: 6px;
+      background: #313244;
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      background: var(--accent);
+      width: 0%;
+      transition: width 0.3s ease;
+    }
+
+    .form-group {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    label {
+      font-size: 12px;
+      color: var(--text-secondary);
+      font-weight: bold;
+    }
+
+    .form-row {
+      display: flex;
+      gap: 8px;
+    }
+
+    .toast {
+      position: fixed;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      padding: 10px 20px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: bold;
+      box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+      z-index: 9999;
+      opacity: 0;
+      transition: opacity 0.3s;
+      pointer-events: none;
+    }
+    .toast.show { opacity: 1; }
+    .toast.success { background: var(--success); color: #11111b; }
+    .toast.error { background: var(--danger); color: #11111b; }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="logo">📡 StreamBot 遠端遙控</div>
+    <div id="connBadge" class="status-badge offline">
+      <span style="width: 8px; height: 8px; border-radius: 50%; background: currentColor;"></span>
+      <span id="connStatusText">未連線</span>
+    </div>
+  </header>
+
+  <div class="card">
+    <div class="card-title">🌐 伺服器主機連線位址</div>
+    <div class="host-input-group">
+      <input type="text" id="hostInput" placeholder="http://192.168.x.x:18730">
+      <button class="btn-primary" onclick="connectServer()">⚡ 連線</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="control-row">
+      <div class="monitor-info">
+        <span style="font-size: 12px; color: var(--text-secondary);">全域監控狀態</span>
+        <span id="monitorStateText" style="font-size: 16px; font-weight: bold; color: var(--text-primary);">讀取中...</span>
+      </div>
+      <button id="toggleMonitorBtn" class="btn-success" onclick="toggleMonitoring()">▶️ 啟動監控</button>
+    </div>
+  </div>
+
+  <div class="nav-tabs">
+    <button class="tab-btn active" onclick="switchTab('tasks')">⚡ 進行中任務 (<span id="taskCount">0</span>)</button>
+    <button class="tab-btn" onclick="switchTab('manual')">🚀 手動下載</button>
+    <button class="tab-btn" onclick="switchTab('channels')">📺 頻道清單</button>
+  </div>
+
+  <!-- Tab 1: 進行中任務 -->
+  <div id="tab-tasks" class="tab-content active">
+    <div id="taskList" style="display: flex; flex-direction: column; gap: 8px;">
+      <div style="text-align: center; color: var(--text-secondary); padding: 20px; font-size: 13px;">目前無正在執行的任務</div>
+    </div>
+  </div>
+
+  <!-- Tab 2: 手動下載 -->
+  <div id="tab-manual" class="tab-content">
+    <div class="card">
+      <div class="form-group">
+        <label>影音/直播網址 (URL)</label>
+        <input type="url" id="manualUrl" placeholder="https://rplay.live/live/... 或 YouTube/Withny">
+      </div>
+
+      <div class="form-group">
+        <label>自訂資料夾/檔案名稱 (預設: Manual_Downloads)</label>
+        <input type="text" id="manualName" placeholder="例如: 天羽演唱會">
+      </div>
+
+      <div class="form-row">
+        <div class="form-group" style="flex: 1;">
+          <label>平台選擇</label>
+          <select id="manualPlatform">
+            <option value="自動偵測">自動偵測</option>
+            <option value="Rplay">Rplay</option>
+            <option value="Withny">Withny</option>
+            <option value="YouTube">YouTube</option>
+            <option value="FC2">FC2</option>
+          </select>
+        </div>
+        <div class="form-group" style="flex: 1;">
+          <label>畫質優先</label>
+          <select id="manualQuality">
+            <option value="best">最佳畫質 (best)</option>
+            <option value="1080p">1080p</option>
+            <option value="720p">720p</option>
+            <option value="480p">480p</option>
+          </select>
+        </div>
+        <div class="form-group" style="flex: 1;">
+          <label>格式</label>
+          <select id="manualFormat">
+            <option value="mp4">mp4</option>
+            <option value="mkv">mkv</option>
+            <option value="ts">ts</option>
+          </select>
+        </div>
+      </div>
+
+      <button class="btn-purple" style="margin-top: 6px; padding: 12px;" onclick="submitManualDownload()">🚀 立即發起手動下載</button>
+    </div>
+  </div>
+
+  <!-- Tab 3: 頻道清單 -->
+  <div id="tab-channels" class="tab-content">
+    <div id="channelList" style="display: flex; flex-direction: column; gap: 8px;">
+      <div style="text-align: center; color: var(--text-secondary); padding: 20px; font-size: 13px;">讀取頻道清單中...</div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <script>
+    let serverHost = window.location.origin && window.location.origin.includes('http') ? window.location.origin : 'http://127.0.0.1:18730';
+    let isMonitoring = false;
+    let pollTimer = null;
+
+    document.getElementById('hostInput').value = serverHost;
+
+    function showToast(msg, isError = false) {
+      const t = document.getElementById('toast');
+      t.textContent = msg;
+      t.className = `toast show ${isError ? 'error' : 'success'}`;
+      setTimeout(() => t.className = 'toast', 2500);
+    }
+
+    function switchTab(name) {
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+      
+      event.target.classList.add('active');
+      document.getElementById(`tab-${name}`).classList.add('active');
+    }
+
+    async function connectServer() {
+      const val = document.getElementById('hostInput').value.trim();
+      if (!val) return;
+      serverHost = val.replace(/\/+$/, '');
+      await fetchStatus();
+      showToast('已連線至伺服器');
+    }
+
+    async function fetchStatus() {
+      try {
+        const res = await fetch(`${serverHost}/api/status`, { cache: 'no-cache' });
+        if (!res.ok) throw new Error('API 響應錯誤');
+        const data = await res.json();
+
+        // Update connection status
+        document.getElementById('connBadge').className = 'status-badge online';
+        document.getElementById('connStatusText').textContent = '已連線';
+
+        // Update monitoring UI
+        isMonitoring = data.is_monitoring;
+        const mText = document.getElementById('monitorStateText');
+        const mBtn = document.getElementById('toggleMonitorBtn');
+
+        if (isMonitoring) {
+          mText.textContent = '🟢 監控中 (正在對頻道進行即時掃描)';
+          mText.style.color = 'var(--success)';
+          mBtn.textContent = '🛑 停止監控';
+          mBtn.className = 'btn-danger';
+        } else {
+          mText.textContent = '🔴 靜止中 (未開啟全域監控)';
+          mText.style.color = 'var(--danger)';
+          mBtn.textContent = '▶️ 啟動監控';
+          mBtn.className = 'btn-success';
+        }
+
+        // Render Active Tasks
+        renderTasks(data.active_tasks || []);
+        
+        // Render Channels
+        renderChannels(data.channels || []);
+
+      } catch (err) {
+        document.getElementById('connBadge').className = 'status-badge offline';
+        document.getElementById('connStatusText').textContent = '連線失敗';
+      }
+    }
+
+    function renderTasks(tasks) {
+      document.getElementById('taskCount').textContent = tasks.length;
+      const container = document.getElementById('taskList');
+
+      if (tasks.length === 0) {
+        container.innerHTML = `<div style="text-align: center; color: var(--text-secondary); padding: 20px; font-size: 13px;">目前無正在執行的任務</div>`;
+        return;
+      }
+
+      container.innerHTML = tasks.map(t => {
+        const pct = Math.round((t.progress || 0) * 100);
+        return `
+          <div class="task-card">
+            <div class="task-header">
+              <span>${t.channel_name}</span>
+              <span style="color: var(--accent);">${t.status}</span>
+            </div>
+            <div class="progress-bar-bg">
+              <div class="progress-bar-fill" style="width: ${pct}%;"></div>
+            </div>
+            <div class="task-meta">
+              <span>${t.platform} • ${pct}%</span>
+              <span>${t.speed || ''} ${t.size ? '(' + t.size + ')' : ''}</span>
+              <span>已耗時: ${t.elapsed || '00:00'}</span>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    function renderChannels(channels) {
+      const container = document.getElementById('channelList');
+      if (channels.length === 0) {
+        container.innerHTML = `<div style="text-align: center; color: var(--text-secondary); padding: 20px; font-size: 13px;">暫無監控頻道</div>`;
+        return;
+      }
+
+      container.innerHTML = channels.map(c => `
+        <div class="task-card" style="flex-direction: row; justify-content: space-between; align-items: center;">
+          <div>
+            <div style="font-weight: bold; font-size: 14px;">${c.name}</div>
+            <div style="font-size: 12px; color: var(--text-secondary);">${c.platform}</div>
+          </div>
+          <span class="status-badge ${c.record ? 'online' : 'offline'}">${c.record ? '📹 自動錄影' : '🔔 僅通知'}</span>
+        </div>
+      `).join('');
+    }
+
+    async function toggleMonitoring() {
+      const endpoint = isMonitoring ? '/api/monitoring/stop' : '/api/monitoring/start';
+      try {
+        const res = await fetch(`${serverHost}${endpoint}`, { method: 'POST' });
+        const data = await res.json();
+        showToast(isMonitoring ? '已停止全域監控' : '已啟動全域監控');
+        await fetchStatus();
+      } catch (e) {
+        showToast('切換監控狀態失敗', true);
+      }
+    }
+
+    async function submitManualDownload() {
+      const url = document.getElementById('manualUrl').value.trim();
+      const name = document.getElementById('manualName').value.trim();
+      const platform = document.getElementById('manualPlatform').value;
+      const quality = document.getElementById('manualQuality').value;
+      const format = document.getElementById('manualFormat').value;
+
+      if (!url) {
+        showToast('請輸入影音網址', true);
+        return;
+      }
+
+      try {
+        const res = await fetch(`${serverHost}/api/manual_download`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url, name, platform, quality, format })
+        });
+        const data = await res.json();
+        if (data.status === 'ok') {
+          showToast('🚀 已成功新增下載任務！');
+          document.getElementById('manualUrl').value = '';
+          switchTab('tasks');
+          await fetchStatus();
+        } else {
+          showToast(data.message || '新增失敗', true);
+        }
+      } catch (e) {
+        showToast('發起手動下載連線失敗', true);
+      }
+    }
+
+    // Auto polling
+    fetchStatus();
+    setInterval(fetchStatus, 2000);
+  </script>
+</body>
+</html>

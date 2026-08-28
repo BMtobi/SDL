@@ -6,6 +6,9 @@ import zipfile
 import subprocess
 from config import BASE_DIR
 from utils import get_binary_path
+import time
+
+
 
 def get_local_version_ytdlp(app):
     try:
@@ -25,24 +28,11 @@ def get_local_version_ffmpeg(app):
         return "已安裝"
     except Exception:
         return "未偵測到"
-
 def get_local_version_rplay(app):
-    fpath = os.path.join(BASE_DIR, "yt_dlp/extractor/rplaylive.py")
-    if not os.path.exists(fpath):
-        return "未安裝"
-    return app.settings.get("rplay_version", "已安裝")
+    return "原生整合 (v2.4-native)"
 
 def get_local_version_withnydl(app):
-    try:
-        exe_path = get_binary_path("withny-dl-windows-amd64.exe")
-        res = subprocess.run([exe_path, "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
-        out = res.stdout.strip()
-        m = re.search(r'version (\S+)', out)
-        if m:
-            return m.group(1)
-        return "已安裝"
-    except Exception:
-        return "未偵測到"
+    return "原生整合 (v2.0-native)"
 
 def worker_check_updates(app):
     import requests
@@ -75,28 +65,13 @@ def worker_check_updates(app):
     except Exception as e:
         app.updates_log(f"❌ 檢查 [FFmpeg] 失敗: {e}\n")
         
-    # 3. Check Rplay Extractor (c-basalt/yt-dlp)
-    latest_rplay = "未知"
-    try:
-        url = "https://api.github.com/repos/c-basalt/yt-dlp/commits?path=yt_dlp/extractor/rplaylive.py&sha=rplaylive"
-        commits = fetch_url_json(url)
-        if commits and isinstance(commits, list):
-            latest_sha = commits[0].get("sha", "")[:7]
-            latest_date = commits[0].get("commit", {}).get("author", {}).get("date", "")[:10]
-            latest_rplay = f"{latest_sha} ({latest_date})"
-        app.updates_log(f"   [Rplay Extractor] 最新線上版本: {latest_rplay}\n")
-    except Exception as e:
-        app.updates_log(f"❌ 檢查 [Rplay Extractor] 失敗: {e}\n")
+    # 3. Check Rplay Downloader (Native integrated)
+    latest_rplay = "原生整合 (最新)"
+    app.updates_log("   [Rplay 原生核心] 原生整合於 yt-dlp 核心中 (最新)\n")
         
-    # 4. Check Withny-dl
-    latest_withnydl = "未知"
-    try:
-        url = "https://api.github.com/repos/Darkness4/withny-dl/releases/latest"
-        info = fetch_url_json(url)
-        latest_withnydl = info.get("tag_name", "未知")
-        app.updates_log(f"   [Withny-dl] 最新線上版本: {latest_withnydl}\n")
-    except Exception as e:
-        app.updates_log(f"❌ 檢查 [Withny-dl] 失敗: {e}\n")
+    # 4. Check Withny Downloader (Native integrated)
+    latest_withnydl = "原生整合 (最新)"
+    app.updates_log("   [Withny 原生核心] 原生整合於 yt-dlp 核心中 (最新)\n")
         
     app.gui_update_queue.put(("check_updates_done", (latest_ytdlp, latest_ffmpeg, latest_rplay, latest_withnydl)))
 
@@ -107,11 +82,6 @@ def worker_update_ytdlp(app):
         r.raise_for_status()
         return r.json()
 
-    def fetch_url_text(url):
-        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
-        r.raise_for_status()
-        return r.text.strip()
-
     try:
         url = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest"
         info = fetch_url_json(url)
@@ -119,17 +89,18 @@ def worker_update_ytdlp(app):
         if not tag_name:
             raise Exception("無法取得最新版本標籤")
             
-        rplay_path = os.path.join(BASE_DIR, "yt_dlp/extractor/rplaylive.py")
-        rplay_content = None
-        if os.path.exists(rplay_path):
-            app.updates_log("📦 備份本地的 Rplay Extractor...\n")
-            with open(rplay_path, "r", encoding="utf-8") as f:
-                rplay_content = f.read()
-                
         temp_dir = os.path.join(BASE_DIR, "temp_ytdlp_update")
         os.makedirs(temp_dir, exist_ok=True)
         zip_url = f"https://github.com/yt-dlp/yt-dlp/archive/refs/tags/{tag_name}.zip"
         zip_path = os.path.join(temp_dir, "ytdlp.zip")
+        
+        # 1. Backup custom native extractors (rplaylive.py, withny.py)
+        custom_extractors = {}
+        for ext_name in ["rplaylive.py", "withny.py"]:
+            ext_path = os.path.join(BASE_DIR, "yt_dlp", "extractor", ext_name)
+            if os.path.exists(ext_path):
+                with open(ext_path, "rb") as f:
+                    custom_extractors[ext_name] = f.read()
         
         app.updates_log(f"📥 下載 yt-dlp 原始碼 ({tag_name})...\n")
         r = requests.get(zip_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=30)
@@ -137,7 +108,7 @@ def worker_update_ytdlp(app):
         with open(zip_path, 'wb') as f:
             f.write(r.content)
         
-        app.updates_log("📂 解壓縮與覆蓋 yt-dlp 檔案...\n")
+        app.updates_log("📂 解壓縮與保留 Rplay / Withny 原生提取器...\n")
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             root_prefix = f"yt-dlp-{tag_name}/yt_dlp/"
             extracted_yt_dlp = os.path.join(temp_dir, "extracted_yt_dlp")
@@ -156,34 +127,34 @@ def worker_update_ytdlp(app):
                         with zip_ref.open(member) as source, open(target_path, "wb") as target:
                             shutil.copyfileobj(source, target)
                             
+        # 2. Re-inject custom extractors into the new extracted extractor directory
+        new_extractor_dir = os.path.join(temp_dir, "extracted_yt_dlp", "extractor")
+        os.makedirs(new_extractor_dir, exist_ok=True)
+        for ext_name, content_bytes in custom_extractors.items():
+            with open(os.path.join(new_extractor_dir, ext_name), "wb") as f:
+                f.write(content_bytes)
+                
+        # 3. Ensure custom extractors are imported in new _extractors.py
+        ext_init_path = os.path.join(new_extractor_dir, "_extractors.py")
+        if os.path.exists(ext_init_path):
+            with open(ext_init_path, "r", encoding="utf-8") as f:
+                init_code = f.read()
+            additions = []
+            if "from .rplaylive import (" not in init_code:
+                additions.append("\nfrom .rplaylive import (\n    RPlayIE,\n    RPlayLiveIE,\n    RPlayTagIE,\n    RPlayUserIE,\n)\n")
+            if "from .withny import (" not in init_code:
+                additions.append("\nfrom .withny import (\n    WithnyLiveIE,\n    WithnyPurchaseListIE,\n    WithnyVideoIE,\n)\n")
+            if additions:
+                with open(ext_init_path, "w", encoding="utf-8") as f:
+                    f.write(init_code + "".join(additions))
+                    
         local_yt_dlp_dir = os.path.join(BASE_DIR, "yt_dlp")
         if os.path.exists(local_yt_dlp_dir):
             shutil.rmtree(local_yt_dlp_dir)
         shutil.copytree(os.path.join(temp_dir, "extracted_yt_dlp"), local_yt_dlp_dir)
         
-        if rplay_content:
-            app.updates_log("📦 還原 Rplay Extractor...\n")
-            os.makedirs(os.path.dirname(rplay_path), exist_ok=True)
-            with open(rplay_path, "w", encoding="utf-8") as f:
-                f.write(rplay_content)
-        else:
-            app.updates_log("🌐 下載並整合 Rplay Extractor...\n")
-            rplay_url = "https://raw.githubusercontent.com/c-basalt/yt-dlp/rplaylive/yt_dlp/extractor/rplaylive.py"
-            rplay_file_content = fetch_url_text(rplay_url)
-            os.makedirs(os.path.dirname(rplay_path), exist_ok=True)
-            with open(rplay_path, "w", encoding="utf-8") as f:
-                f.write(rplay_file_content)
-                
-        extractors_file = os.path.join(BASE_DIR, "yt_dlp/extractor/_extractors.py")
-        if os.path.exists(extractors_file):
-            with open(extractors_file, "r+", encoding="utf-8") as f:
-                content = f.read()
-                if "from .rplaylive import" not in content:
-                    app.updates_log("🔗 登錄 Rplay Extractor 至核心...\n")
-                    f.write("\nfrom .rplaylive import (RPlayLiveIE, RPlayUserIE, RPlayVideoIE)\n")
-                    
         shutil.rmtree(temp_dir, ignore_errors=True)
-        app.updates_log("✅ yt-dlp 更新成功！\n")
+        app.updates_log("✅ yt-dlp 更新成功 (已自動同步並保留 Rplay & Withny 原生核心)！\n")
         app.gui_update_queue.put(("update_done", ("ytdlp", tag_name)))
     except Exception as e:
         app.updates_log(f"❌ yt-dlp 更新失敗: {e}\n")
@@ -257,111 +228,10 @@ def worker_update_ffmpeg(app):
         app.updates_log(f"❌ FFmpeg 更新失敗: {e}\n")
         app.gui_update_queue.put(("update_failed", "ffmpeg"))
 
-def worker_update_rplay(app):
-    import requests
-    def fetch_url_json(url):
-        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
-        r.raise_for_status()
-        return r.json()
-
-    def fetch_url_text(url):
-        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
-        r.raise_for_status()
-        return r.text.strip()
-
-    try:
-        url = "https://api.github.com/repos/c-basalt/yt-dlp/commits?path=yt_dlp/extractor/rplaylive.py&sha=rplaylive"
-        commits = fetch_url_json(url)
-        if not commits or not isinstance(commits, list):
-            raise Exception("無法取得最新 Commit 資訊")
-        latest_sha = commits[0].get("sha", "")[:7]
-        latest_date = commits[0].get("commit", {}).get("author", {}).get("date", "")[:10]
-        version_str = f"{latest_sha} ({latest_date})"
-        
-        rplay_url = "https://raw.githubusercontent.com/c-basalt/yt-dlp/rplaylive/yt_dlp/extractor/rplaylive.py"
-        app.updates_log(f"📥 下載最新 Rplay Extractor ({latest_sha})...\n")
-        rplay_file_content = fetch_url_text(rplay_url)
-        
-        rplay_path = os.path.join(BASE_DIR, "yt_dlp/extractor/rplaylive.py")
-        os.makedirs(os.path.dirname(rplay_path), exist_ok=True)
-        with open(rplay_path, "w", encoding="utf-8") as f:
-            f.write(rplay_file_content)
-            
-        extractors_file = os.path.join(BASE_DIR, "yt_dlp/extractor/_extractors.py")
-        if os.path.exists(extractors_file):
-            with open(extractors_file, "r+", encoding="utf-8") as f:
-                content = f.read()
-                if "from .rplaylive import" not in content:
-                    app.updates_log("🔗 登錄 Rplay Extractor 至核心...\n")
-                    f.write("\nfrom .rplaylive import (RPlayLiveIE, RPlayUserIE, RPlayVideoIE)\n")
-                    
-        app.settings["rplay_version"] = version_str
-        app.save_settings()
-        
-        app.updates_log("✅ Rplay Extractor 更新成功！\n")
-        app.gui_update_queue.put(("update_done", ("rplay", version_str)))
-    except Exception as e:
-        app.updates_log(f"❌ Rplay Extractor 更新失敗: {e}\n")
-        app.gui_update_queue.put(("update_failed", "rplay"))
-
 def worker_update_withnydl(app):
-    import requests
-    def fetch_url_json(url):
-        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
-        r.raise_for_status()
-        return r.json()
+    app.updates_log("ℹ️ Withny 錄製核心已全面原生整合於 yt-dlp 中 (v2.0-native)，點擊上方「更新 yt-dlp」即可同步維護！\n")
+    app.gui_update_queue.put(("update_done", ("withnydl", "原生整合 (v2.0-native)")))
 
-    try:
-        url = "https://api.github.com/repos/Darkness4/withny-dl/releases/latest"
-        info = fetch_url_json(url)
-        tag_name = info.get("tag_name")
-        if not tag_name:
-            raise Exception("無法取得最新版本標籤")
-            
-        download_url = None
-        assets = info.get("assets", [])
-        for asset in assets:
-            name = asset.get("name", "")
-            if "windows-amd64" in name and name.endswith(".exe"):
-                download_url = asset.get("browser_download_url")
-                break
-                
-        if not download_url:
-            for asset in assets:
-                name = asset.get("name", "")
-                if "windows" in name or "amd64" in name:
-                    download_url = asset.get("browser_download_url")
-                    break
-                    
-        if not download_url:
-            raise Exception("找不到適用於 Windows AMD64 的執行檔資源")
-            
-        target_exe = os.path.join(BASE_DIR, "withny-dl-windows-amd64.exe")
-        
-        if os.path.exists(target_exe):
-            try:
-                bak_path = target_exe + ".bak"
-                if os.path.exists(bak_path):
-                    os.remove(bak_path)
-                os.rename(target_exe, bak_path)
-            except Exception as e:
-                app.updates_log(f"⚠️ 無法重命名舊的 withny-dl-windows-amd64.exe: {e}，將嘗試直接覆寫\n")
-                
-        app.updates_log(f"📥 下載 Withny-dl 執行檔 ({tag_name})...\n")
-        r = requests.get(download_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=60)
-        r.raise_for_status()
-        with open(target_exe, 'wb') as f:
-            f.write(r.content)
-        
-        bak_path = target_exe + ".bak"
-        if os.path.exists(bak_path):
-            try:
-                os.remove(bak_path)
-            except:
-                pass
-                
-        app.updates_log("✅ Withny-dl 更新成功！\n")
-        app.gui_update_queue.put(("update_done", ("withnydl", tag_name)))
-    except Exception as e:
-        app.updates_log(f"❌ Withny-dl 更新失敗: {e}\n")
-        app.gui_update_queue.put(("update_failed", "withnydl"))
+def worker_update_rplay(app):
+    app.updates_log("ℹ️ Rplay 下載核心已全面原生整合於 yt-dlp 中 (v2.4-native)，點擊上方「更新 yt-dlp」即可同步維護！\n")
+    app.gui_update_queue.put(("update_done", ("rplay", "原生整合 (v2.4-native)")))

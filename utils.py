@@ -173,3 +173,37 @@ def clean_dir_leftovers(download_dir):
             except Exception as e:
                 print(f"Error cleaning file {file_path}: {e}")
 
+def verify_rplay_token(token, user_oid=None):
+    """
+    驗證 Rplay Token 是否有效
+    回傳: (is_valid: bool, user_identifier_or_msg: str)
+    """
+    if not token or not token.strip():
+        return False, "Token 為空"
+        
+    token = token.strip()
+    import urllib.request
+    import json
+    import gzip
+    
+    url = f'https://api.rplay.live/account/getuser?userOid={user_oid}' if user_oid else 'https://api.rplay.live/content'
+    req = urllib.request.Request(
+        url,
+        headers={
+            'Referer': 'https://rplay.live/',
+            'Origin': 'https://rplay.live',
+            'Authorization': token,
+            'User-Agent': 'Mozilla/5.0'
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=6) as res:
+            raw = res.read()
+            if raw.startswith(b'\x1f\x8b'):
+                raw = gzip.decompress(raw)
+            data = json.loads(raw.decode('utf-8'))
+            name = data.get('nickname') or data.get('name') or data.get('user') or (data.get('title') if isinstance(data, dict) else 'OK')
+            return True, str(name)
+    except Exception as e:
+        return False, str(e)
+

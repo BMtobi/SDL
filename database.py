@@ -8,7 +8,7 @@ def load_all_configs(app):
     # Settings
     if os.path.exists(SETTINGS_FILE):
         try:
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            with open(SETTINGS_FILE, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
                 for k, v in data.items():
                     app.settings[k] = v
@@ -40,8 +40,9 @@ def save_settings(app):
 
 def sync_withny_credentials(app):
     try:
+        token_str = json.dumps(app.settings.get('withny_token', ''), ensure_ascii=False)
         with open(os.path.join(BASE_DIR, CREDENTIALS_FILE), "w", encoding="utf-8") as f:
-            f.write(f"sessionToken: '{app.settings['withny_token']}'\n")
+            f.write(f"sessionToken: {token_str}\n")
     except Exception as e:
         app.add_log(f"同步 credentials.yaml 失敗: {e}", "ERROR")
 
@@ -144,3 +145,14 @@ def add_history_entry(app, channel_name, platform, title, file_path):
         app.gui_update_queue.put(("refresh_history", None))
     except Exception as e:
         print(f"Error saving history: {e}")
+
+def clear_history(app):
+    app.history = []
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(app.history, f, indent=4, ensure_ascii=False)
+        app.gui_update_queue.put(("refresh_history", None))
+        return True
+    except Exception as e:
+        app.add_log(f"清理歷史紀錄檔案失敗: {e}", "ERROR")
+        return False

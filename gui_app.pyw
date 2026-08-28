@@ -1,11 +1,15 @@
 import sys
 import os
+import re
+import random
 import queue
 import time
 import tempfile
 import threading
 import subprocess
 from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import json
 
 # Import modular project components
 from config import BASE_DIR, CONFIG_FILE, CREDENTIALS_FILE, SETTINGS_FILE, DEFAULT_SETTINGS, HISTORY_FILE
@@ -18,6 +22,194 @@ import customtkinter as ctk
 from tkinter import messagebox
 import tkinter as tk
 from PIL import ImageTk
+
+# Token Auto-Sync HTTP handler for Tampermonkey / Chrome extensions
+class TokenSyncHandler(BaseHTTPRequestHandler):
+    app_instance = None
+
+    def log_message(self, format, *args):
+        pass # Suppress default HTTP server stdout logging
+
+    def send_cors_headers(self):
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_cors_headers()
+        self.end_headers()
+
+    def do_GET(self):
+        if self.path in ('/', '/index.html', '/remote', '/remote_control.html'):
+            html_path = os.path.join(BASE_DIR, "remote_control.html")
+            if os.path.exists(html_path):
+                try:
+                    with open(html_path, 'r', encoding='utf-8') as f:
+                        html_content = f.read()
+                    self.send_response(200)
+                    self.send_cors_headers()
+                    self.send_header('Content-Type', 'text/html; charset=utf-8')
+                    self.end_headers()
+                    self.wfile.write(html_content.encode('utf-8'))
+                    return
+                except Exception:
+                    pass
+        elif self.path == '/api/status':
+            if self.app_instance:
+                try:
+                    now = time.time()
+                    tasks_list = []
+                    for uid, v in list(self.app_instance.active_tasks.items()):
+                        st = v.get("start_time", now)
+                        elapsed_secs = int(now - st)
+                        tasks_list.append({
+                            "uid": uid,
+                            "channel_name": v.get("channel_name", ""),
+                            "platform": v.get("platform", ""),
+                            "status": v.get("status", ""),
+                            "progress": v.get("progress", 0.0),
+                            "speed": v.get("speed", ""),
+                            "size": v.get("size", ""),
+                            "elapsed": format_duration_zh(elapsed_secs)
+                        })
+                    
+                    channels_list = []
+                    for c in self.app_instance.channels:
+                        channels_list.append({
+                            "name": c.get("name"),
+                            "url": c.get("url"),
+                            "record": c.get("record"),
+                            "platform": detect_platform(c.get("url", ""))
+                        })
+                        
+                    res_data = {
+                        "is_monitoring": self.app_instance.is_monitoring,
+                        "channels_count": len(self.app_instance.channels),
+                        "lan_ip": self.app_instance.get_current_lan_ip(),
+                        "active_tasks": tasks_list,
+                        "channels": channels_list
+                    }
+                    self.send_response(200)
+                    self.send_cors_headers()
+                    self.send_header('Content-Type', 'application/json; charset=utf-8')
+                    self.end_headers()
+                    self.wfile.write(json.dumps(res_data, ensure_ascii=False).encode('utf-8'))
+                    return
+                except Exception as e:
+                    pass
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self):
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length) if content_length > 0 else b'{}'
+            data = json.loads(post_data.decode('utf-8')) if post_data else {}
+            token = data.get('token', '').strip()
+            platform = data.get('platform', '').lower()
+            
+            if self.path == '/api/monitoring/start':
+                if self.app_instance:
+                    self.app_instance.gui_update_queue.put(("start_monitoring", None))
+                    self.app_instance.add_log("🌐 [遠端控制] 收到啟動全域監控指令", "INFO")
+                self.send_response(200)
+                self.send_cors_headers()
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'status': 'ok', 'is_monitoring': True}).encode('utf-8'))
+                return
+            elif self.path == '/api/monitoring/stop':
+                if self.app_instance:
+                    self.app_instance.gui_update_queue.put(("stop_monitoring", None))
+                    self.app_instance.add_log("🌐 [遠端控制] 收到停止全域監控指令", "INFO")
+                self.send_response(200)
+                self.send_cors_headers()
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'status': 'ok', 'is_monitoring': False}).encode('utf-8'))
+                return
+            elif self.path == '/api/manual_download':
+                if self.app_instance:
+                    url = data.get('url', '').strip()
+                    name = data.get('name', '').strip()
+                    plat = data.get('platform', '自動偵測')
+                    quality = data.get('quality', 'best')
+                    fmt = data.get('format', 'mp4')
+                    ok, msg = self.app_instance.start_api_manual_download(url, name, plat, quality, fmt)
+                    self.send_response(200 if ok else 400)
+                    self.send_cors_headers()
+                    self.send_header('Content-Type', 'application/json; charset=utf-8')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({'status': 'ok' if ok else 'error', 'message': msg}, ensure_ascii=False).encode('utf-8'))
+                    return
+            elif self.path in ('/update_withny_token', '/withny_token') or platform == 'withny':
+                if token and self.app_instance:
+                    if token.startswith("{") or len(token) < 20:
+                        self.app_instance.add_log("⚠️ [油猴同步] 收到無效的 Withny Token 格式，已拒絕同步", "WARNING")
+                    else:
+                        old_token = self.app_instance.settings.get('withny_token', '')
+                        if token != old_token:
+                            self.app_instance.settings['withny_token'] = token
+                            self.app_instance.save_settings()
+                            self.app_instance.add_log("✅ [油猴同步] 已透過腳本即時更新 Withny Token！", "SUCCESS")
+                            try:
+                                self.app_instance.gui_update_queue.put(("refresh_settings_ui", None))
+                            except Exception:
+                                pass
+                        else:
+                            self.app_instance.add_log("ℹ️ [油猴同步] 收到 Withny Token (與目前設定一致，無需更新)", "INFO")
+                self.send_response(200)
+                self.send_cors_headers()
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'status': 'ok'}).encode('utf-8'))
+                return
+            elif self.path in ('/update_token', '/token'):
+                if token and self.app_instance:
+                    old_token = self.app_instance.settings.get('rplay_token', '')
+                    self.app_instance.settings['rplay_token'] = token
+                    self.app_instance.save_settings()
+                    
+                    from utils import verify_rplay_token
+                    is_valid, user_or_err = verify_rplay_token(token, self.app_instance.settings.get('rplay_username'))
+                    if is_valid:
+                        self.app_instance.add_log(f"✅ [插件同步] Rplay Token 驗證通過 (帳號: {user_or_err})！", "SUCCESS")
+                        if getattr(self.app_instance, 'paused_rplay_task', None):
+                            task_to_resume = self.app_instance.paused_rplay_task
+                            self.app_instance.paused_rplay_task = None
+                            self.app_instance.resume_paused_rplay_task(task_to_resume)
+                    else:
+                        self.app_instance.add_log(f"⚠️ [插件同步] 收到 Rplay Token 但驗證未通過: {user_or_err}", "WARNING")
+                        
+                    try:
+                        self.app_instance.gui_update_queue.put(("refresh_settings_ui", None))
+                    except Exception:
+                        pass
+                
+                self.send_response(200)
+                self.send_cors_headers()
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'status': 'ok'}).encode('utf-8'))
+                return
+        except Exception:
+            pass
+            
+        self.send_response(400)
+        self.end_headers()
+
+# Helper for duration formatting
+def format_duration_zh(seconds):
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    if hours > 0:
+        return f"{hours}小時{minutes}分{secs}秒"
+    elif minutes > 0:
+        return f"{minutes}分{secs}秒"
+    else:
+        return f"{secs}秒"
 
 class NativeScrollableFrame(tk.Canvas):
     def __init__(self, parent, bg_color, **kwargs):
@@ -49,29 +241,11 @@ class NativeScrollableFrame(tk.Canvas):
         self.scroll_content.bind("<Configure>", self._on_content_configure)
         self.bind("<Configure>", self._on_canvas_configure)
         
-        # Bind MouseWheel globally
-        self.bind_all("<MouseWheel>", self._on_mousewheel)
-        
     def _on_content_configure(self, event):
         self.configure(scrollregion=self.bbox("all"))
         
     def _on_canvas_configure(self, event):
         self.itemconfig(self.window_id, width=event.width)
-        
-    def _on_mousewheel(self, event):
-        is_descendant = False
-        widget = event.widget
-        try:
-            while widget:
-                if widget == self.container:
-                    is_descendant = True
-                    break
-                widget = getattr(widget, "master", None)
-        except Exception:
-            pass
-            
-        if is_descendant and event.delta:
-            self.yview_scroll(int(-1 * (event.delta / 120)), "units")
             
     def yview(self, *args):
         if not args:
@@ -121,37 +295,52 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         
-        # Color Palette Settings
-        self.c_bg = "#0c1315"
-        self.c_sidebar = "#080e10"
-        self.c_frame = "#0d1719"
-        self.c_card = "#111d20"
-        self.c_card_border = "#1c3135"
-        self.c_card_selected = "#142629"
+        # Color Palette Settings (Linear / Raycast Slate Dark Design System)
+        self.c_bg = "#0b0f17"                  # Deep Space Slate Background
+        self.c_sidebar = "#070a0f"             # Solid Dark Sidebar Foundation
+        self.c_frame = "#111722"               # Elevated Surface Container
+        self.c_card = "#161e2e"                # Slate Card Base
+        self.c_card_hover = "#1e293b"          # Card Hover State
+        self.c_card_selected = "#1e283d"       # Selected Card Fill
+        self.c_card_border = "#202a3c"         # 1px Subtle Hairline Border
+        self.c_card_selected_border = "#38bdf8"# Selected Card Border Highlight
         
-        self.c_text_primary = "#e2ecec"
-        self.c_text_secondary = "#789092"
+        self.c_text_primary = "#f8fafc"        # Slate-50 (Highest contrast)
+        self.c_text_secondary = "#94a3b8"      # Slate-400 (Clean metadata/labels)
+        self.c_text_muted = "#64748b"          # Slate-500 (Captions, timestamps)
         
-        self.c_accent = "#136c72"
-        self.c_accent_hover = "#18838a"
+        # Primary Brand Accent (Electric Sky / Cyan)
+        self.c_accent = "#0284c7"              # Sky-600 Primary Accent
+        self.c_accent_hover = "#0369a1"        # Sky-700 Hover
+        self.c_accent_light = "#38bdf8"        # Sky-400 Highlight
         
-        self.c_green = "#10b981"
-        self.c_green_bg = "#0d261e"
-        self.c_red = "#ef4444"
-        self.c_red_bg = "#251214"
-        self.c_blue = "#3b82f6"
-        self.c_blue_bg = "#0f1c2d"
-        self.c_purple = "#8b5cf6"
-        self.c_purple_bg = "#19152b"
-        self.c_yellow = "#f59e0b"
-        self.c_yellow_bg = "#24180d"
+        # Semantic Accents
+        self.c_green = "#10b981"               # Emerald-500
+        self.c_green_bg = "#064e3b"            # Emerald-950 / Soft badge
+        self.c_green_text = "#34d399"          # Emerald-400
+        
+        self.c_red = "#f43f5e"                 # Rose-500
+        self.c_red_bg = "#4c0519"              # Rose-950 / Soft badge
+        self.c_red_text = "#fb7185"            # Rose-400
+        
+        self.c_blue = "#38bdf8"                # Sky-400 (Rplay)
+        self.c_blue_bg = "#0c4a6e"             # Sky-950 / Soft badge
+        self.c_blue_text = "#7dd3fc"           # Sky-300
+        
+        self.c_purple = "#a855f7"              # Violet-500 (Withny)
+        self.c_purple_bg = "#3b0764"           # Violet-950 / Soft badge
+        self.c_purple_text = "#c084fc"         # Violet-400
+        
+        self.c_yellow = "#f59e0b"              # Amber-500 (FC2)
+        self.c_yellow_bg = "#451a03"           # Amber-950 / Soft badge
+        self.c_yellow_text = "#fbbf24"         # Amber-400
         
         # Configure root window background
         self.configure(fg_color=self.c_bg)
         
         # Window settings
-        self.title("📡 全能直播監控下載器 (Stream Downloader & Channel Manager)")
-        self.geometry("1300x820")
+        self.title("StreamBot - 直播監控與影音下載管理系統")
+        self.geometry("1300x830")
         self.minsize(1150, 720)
         
         # State variables
@@ -159,6 +348,8 @@ class App(ctk.CTk):
         self.channels = []
         self.history = []
         self.active_tasks = {} # uid -> task_info dict
+        self.ended_discord_tasks = set() # uid set of ended tasks to prevent race conditions
+        self.discord_ws = None # Discord Gateway websocket client
         self.log_queue = queue.Queue()
         self.gui_update_queue = queue.Queue()
         self.selected_channel_index = -1
@@ -170,17 +361,21 @@ class App(ctk.CTk):
         self.current_tab = "dashboard"
         self.channel_card_widgets = {}
         self.local_versions_detected = False
+        self.paused_rplay_task = None
         self.thumbnail_queue = queue.Queue()
         for _ in range(2):
             threading.Thread(target=self.worker_thumbnail_downloader, daemon=True).start()
         
         self.platform_colors = {
-            "Rplay": (self.c_blue, self.c_blue_bg),
-            "Withny": (self.c_purple, self.c_purple_bg),
-            "YouTube": (self.c_red, self.c_red_bg),
-            "FC2": (self.c_yellow, self.c_yellow_bg),
+            "Rplay": (self.c_blue_text, self.c_blue_bg),
+            "Withny": (self.c_purple_text, self.c_purple_bg),
+            "YouTube": (self.c_red_text, self.c_red_bg),
+            "FC2": (self.c_yellow_text, self.c_yellow_bg),
             "Unknown": (self.c_text_secondary, self.c_card)
         }
+        
+        # Global Universal MouseWheel Scrolling Handler
+        self.bind_all("<MouseWheel>", self.handle_universal_mousewheel)
         
         # Load configs
         self.load_all_configs()
@@ -193,19 +388,90 @@ class App(ctk.CTk):
         except Exception as e:
             self.add_log(f"啟動時清理暫存檔失敗: {e}", "WARNING")
         
+        # Monitor session identifier to prevent duplicate thread race conditions
+        self.monitor_session_id = 0
+
         # Build UI layout
         self.build_ui()
         
         # Start GUI polling
         self.poll_gui_updates()
         
+        # Start periodic task timer
+        self.start_periodic_task_timer()
+        
         # Windows sleep prevention
         self.sleep_prevented_active = None
         self.update_sleep_prevention_state()
         
-        # Auto start monitoring if channels loaded
-        if self.channels:
-            self.start_monitoring()
+        # Start Token Auto-Sync HTTP server (port 18730)
+        self.start_token_sync_server()
+        
+        # Start Discord Gateway daemon in background for 24/7 remote command control
+        self.discord_gw_thread = None
+        self.start_discord_gateway()
+        
+        # NOTE: Auto-start monitoring on app launch disabled per user request
+
+    def handle_universal_mousewheel(self, event):
+        if not event.delta:
+            return
+        scroll_units = int(-1 * (event.delta / 120))
+        
+        # Determine target by traversing master hierarchy from event.widget
+        curr = event.widget
+        while curr:
+            # 1. Textbox (tk.Text or CTkTextbox)
+            if isinstance(curr, tk.Text):
+                try:
+                    curr.yview("scroll", scroll_units, "units")
+                    return
+                except Exception:
+                    pass
+            elif isinstance(curr, ctk.CTkTextbox):
+                try:
+                    curr._textbox.yview("scroll", scroll_units, "units")
+                    return
+                except Exception:
+                    pass
+                    
+            # 2. NativeScrollableFrame canvas or its container
+            if isinstance(curr, NativeScrollableFrame):
+                try:
+                    curr.yview("scroll", scroll_units, "units")
+                    return
+                except Exception:
+                    pass
+            elif hasattr(curr, "scroll_content") and isinstance(getattr(curr, "master", None), NativeScrollableFrame):
+                try:
+                    curr.master.yview("scroll", scroll_units, "units")
+                    return
+                except Exception:
+                    pass
+                    
+            # 3. CTkScrollableFrame or child inside CTkScrollableFrame
+            if isinstance(curr, ctk.CTkScrollableFrame) or hasattr(curr, "_parent_canvas"):
+                try:
+                    canvas = getattr(curr, "_parent_canvas", None)
+                    if canvas:
+                        canvas.yview("scroll", scroll_units, "units")
+                        return
+                except Exception:
+                    pass
+                    
+            curr = getattr(curr, "master", None)
+
+    def start_token_sync_server(self):
+        def _run():
+            try:
+                TokenSyncHandler.app_instance = self
+                server = HTTPServer(('0.0.0.0', 18730), TokenSyncHandler)
+                self.add_log("🌐 油猴 Token 自動同步服務已在埠號 18730 啟動 (支援同 Wi-Fi 裝置)", "INFO")
+                server.serve_forever()
+            except Exception as e:
+                self.add_log(f"⚠️ 油猴 Token 同步服務啟動失敗: {e}", "WARNING")
+                
+        threading.Thread(target=_run, daemon=True).start()
 
     # ================= Bridge functions for modular database =================
     def load_all_configs(self):
@@ -232,7 +498,13 @@ class App(ctk.CTk):
         timestamp = datetime.now().strftime("%H:%M:%S")
         log_msg = f"[{timestamp}] [{level}] {message}"
         self.log_queue.put((log_msg, level))
-        print(log_msg)
+        try:
+            print(log_msg)
+        except Exception:
+            try:
+                print(log_msg.encode("utf-8", errors="replace").decode("cp950", errors="replace"))
+            except Exception:
+                pass
 
     # ================= UI Build & Navigation =================
     def build_ui(self):
@@ -241,23 +513,51 @@ class App(ctk.CTk):
         self.grid_columnconfigure(0, weight=0) # Sidebar
         self.grid_columnconfigure(1, weight=1) # Main Viewport Container
         
-        # 1. Left Sidebar Frame (styled matching reference image)
-        sidebar = ctk.CTkFrame(self, width=220, fg_color=self.c_sidebar, corner_radius=0, border_color="#121b1d", border_width=1)
+        # 1. Left Sidebar Frame (Linear / Raycast Dark Foundation)
+        sidebar = ctk.CTkFrame(self, width=225, fg_color=self.c_sidebar, corner_radius=0, border_color=self.c_card_border, border_width=1)
         sidebar.grid(row=0, column=0, sticky="nsew")
-        sidebar.grid_rowconfigure(6, weight=1)
+        sidebar.grid_rowconfigure(8, weight=1)
         
-        # Logo Label
-        logo_lbl = ctk.CTkLabel(sidebar, text="📡 SDL MONITOR", font=ctk.CTkFont(size=20, weight="bold"), text_color=self.c_text_primary)
-        logo_lbl.grid(row=0, column=0, padx=20, pady=25, sticky="w")
+        # Logo & Brand Area
+        brand_frame = ctk.CTkFrame(sidebar, fg_color="transparent")
+        brand_frame.grid(row=0, column=0, padx=16, pady=(20, 15), sticky="ew")
+        
+        logo_lbl = ctk.CTkLabel(
+            brand_frame, 
+            text="⚡ STREAMBOT", 
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=18, weight="bold"), 
+            text_color=self.c_text_primary
+        )
+        logo_lbl.pack(anchor="w")
+        
+        sub_logo_lbl = ctk.CTkLabel(
+            brand_frame,
+            text="MONITOR & ARCHIVE STUDIO",
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=9, weight="bold"),
+            text_color=self.c_text_muted
+        )
+        sub_logo_lbl.pack(anchor="w", pady=(1, 6))
+        
+        # Live System Status Badge in Sidebar
+        self.sidebar_status_badge = ctk.CTkLabel(
+            brand_frame,
+            text="● 系統就緒 (待機中)",
+            fg_color=self.c_frame,
+            text_color=self.c_green_text,
+            corner_radius=6,
+            height=22,
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=11, weight="bold")
+        )
+        self.sidebar_status_badge.pack(fill="x", pady=(2, 0))
         
         # Nav buttons (Pill shape styled active status)
         tabs = [
-            ("dashboard", "📊  監控列表"),
+            ("dashboard", "📊  頻道監控"),
             ("tasks", "📥  下載任務"),
             ("history", "📜  下載紀錄"),
             ("manual", "🔗  手動下載"),
             ("settings", "⚙️  系統設定"),
-            ("updates", "🔄  系統更新"),
+            ("updates", "🔄  元件更新"),
             ("logs", "📝  系統日誌")
         ]
         
@@ -266,33 +566,34 @@ class App(ctk.CTk):
             btn = ctk.CTkButton(
                 sidebar,
                 text=title,
-                height=42,
+                height=40,
                 anchor="w",
-                fg_color="transparent" if tab_id != "dashboard" else self.c_accent,
-                text_color=self.c_text_secondary if tab_id != "dashboard" else self.c_text_primary,
-                font=ctk.CTkFont(size=13, weight="bold"),
-                hover_color=self.c_accent_hover,
+                fg_color="#1e293b" if tab_id == "dashboard" else "transparent",
+                text_color=self.c_accent_light if tab_id == "dashboard" else self.c_text_secondary,
+                font=ctk.CTkFont(family="Segoe UI Variable Text", size=13, weight="bold"),
+                hover_color="#1e293b" if tab_id == "dashboard" else "#131b27",
                 corner_radius=8,
                 command=lambda tid=tab_id: self.select_tab(tid)
             )
-            btn.grid(row=idx+1, column=0, padx=12, pady=5, sticky="ew")
+            btn.grid(row=idx+1, column=0, padx=12, pady=3, sticky="ew")
             self.nav_buttons[tab_id] = btn
             
         # Left Bottom Monitoring Control Block
         self.monitor_btn = ctk.CTkButton(
             sidebar, 
-            text="▶️ 啟動監控", 
-            height=45, 
+            text="▶️ 啟動全域監控", 
+            height=44, 
             fg_color=self.c_accent, 
             hover_color=self.c_accent_hover, 
-            font=ctk.CTkFont(size=14, weight="bold"),
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=13, weight="bold"),
+            corner_radius=8,
             command=self.toggle_monitoring
         )
-        self.monitor_btn.grid(row=8, column=0, padx=12, pady=15, sticky="ew")
+        self.monitor_btn.grid(row=9, column=0, padx=12, pady=16, sticky="ew")
         
         # 2. Main Viewport Container
         self.container = ctk.CTkFrame(self, fg_color="transparent")
-        self.container.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
+        self.container.grid(row=0, column=1, padx=16, pady=16, sticky="nsew")
         self.container.grid_rowconfigure(0, weight=1)
         self.container.grid_columnconfigure(0, weight=1)
         
@@ -321,7 +622,7 @@ class App(ctk.CTk):
                 self.reset_settings_fields_from_state()
                 self.settings_dirty = False
             else: # Cancel (None)
-                self.nav_buttons["settings"].configure(fg_color=self.c_accent, text_color=self.c_text_primary)
+                self.nav_buttons["settings"].configure(fg_color="#1e293b", text_color=self.c_accent_light)
                 if tab_id in self.nav_buttons:
                     self.nav_buttons[tab_id].configure(fg_color="transparent", text_color=self.c_text_secondary)
                 return
@@ -336,19 +637,19 @@ class App(ctk.CTk):
                 self.refresh_channel_list_ui()
                 self.channels_dirty = False
             else: # Cancel (None)
-                self.nav_buttons["dashboard"].configure(fg_color=self.c_accent, text_color=self.c_text_primary)
+                self.nav_buttons["dashboard"].configure(fg_color="#1e293b", text_color=self.c_accent_light)
                 if tab_id in self.nav_buttons:
                     self.nav_buttons[tab_id].configure(fg_color="transparent", text_color=self.c_text_secondary)
                 return
                 
         self.current_tab = tab_id
 
-        # Visual feedback on sidebar buttons matching the active status
+        # Visual feedback on sidebar buttons matching the active status (Linear Slate Accent)
         for tid, btn in self.nav_buttons.items():
             if tid == tab_id:
-                btn.configure(fg_color=self.c_accent, text_color=self.c_text_primary)
+                btn.configure(fg_color="#1e293b", text_color=self.c_accent_light, hover_color="#1e293b")
             else:
-                btn.configure(fg_color="transparent", text_color=self.c_text_secondary)
+                btn.configure(fg_color="transparent", text_color=self.c_text_secondary, hover_color="#131b27")
                 
         # Hide all frames and show targeted one
         for frame in self.frames.values():
@@ -383,26 +684,59 @@ class App(ctk.CTk):
             corner_radius=12
         )
         list_panel.grid(row=0, column=0, padx=(0, 8), pady=0, sticky="nsew")
-        list_panel.grid_rowconfigure(1, weight=1)
+        list_panel.grid_rowconfigure(2, weight=1)
         list_panel.grid_columnconfigure(0, weight=1)
         self.list_panel = list_panel
         
+        # Top KPI Telemetry Banner (4 Metric Tiles)
+        metrics_bar = ctk.CTkFrame(list_panel, fg_color="transparent")
+        metrics_bar.grid(row=0, column=0, padx=12, pady=(12, 4), sticky="ew")
+        for c in range(4):
+            metrics_bar.grid_columnconfigure(c, weight=1)
+            
+        def create_kpi_card(parent, col, title, initial_val, icon, accent_col):
+            card = ctk.CTkFrame(parent, fg_color=self.c_sidebar, border_color=self.c_card_border, border_width=1, corner_radius=8, height=60)
+            card.grid(row=0, column=col, padx=4, pady=0, sticky="ew")
+            card.grid_propagate(False)
+            
+            # Left icon
+            icn_lbl = ctk.CTkLabel(card, text=icon, font=ctk.CTkFont(size=16))
+            icn_lbl.pack(side="left", padx=(12, 8), pady=10)
+            
+            # Right text container (title + value with balanced margins)
+            text_container = ctk.CTkFrame(card, fg_color="transparent")
+            text_container.pack(side="left", fill="both", expand=True, padx=(0, 10), pady=(7, 7))
+            
+            t_lbl = ctk.CTkLabel(text_container, text=title, font=ctk.CTkFont(family="Segoe UI Variable Text", size=10, weight="bold"), text_color=self.c_text_muted, anchor="w")
+            t_lbl.pack(anchor="w", pady=(0, 1))
+            
+            v_lbl = ctk.CTkLabel(text_container, text=initial_val, font=ctk.CTkFont(family="Segoe UI Variable Text", size=13, weight="bold"), text_color=accent_col, anchor="w")
+            v_lbl.pack(anchor="w", pady=(0, 0))
+            return v_lbl
+
+        self.kpi_total_chan = create_kpi_card(metrics_bar, 0, "監控頻道", f"{len(self.channels)} 個", "📡", self.c_text_primary)
+        self.kpi_live_chan = create_kpi_card(metrics_bar, 1, "直播開台", "0 個", "🔴", self.c_green_text)
+        self.kpi_active_tasks = create_kpi_card(metrics_bar, 2, "錄製任務", "0 個", "⚡", self.c_blue_text)
+        self.kpi_sys_status = create_kpi_card(metrics_bar, 3, "監控狀態", "待機中", "🛡️", self.c_text_secondary)
+        
         # List Panel Search Bar
         search_frame = ctk.CTkFrame(list_panel, fg_color="transparent")
-        search_frame.grid(row=0, column=0, padx=16, pady=16, sticky="ew")
+        search_frame.grid(row=1, column=0, padx=12, pady=(8, 8), sticky="ew")
         search_frame.grid_columnconfigure(1, weight=1)
         search_frame.grid_columnconfigure(2, weight=0)
         
-        search_label = ctk.CTkLabel(search_frame, text="🔍 搜尋：", text_color=self.c_text_primary, font=ctk.CTkFont(weight="bold"))
-        search_label.grid(row=0, column=0, padx=4, pady=0)
+        search_label = ctk.CTkLabel(search_frame, text="🔍 搜尋：", text_color=self.c_text_secondary, font=ctk.CTkFont(family="Segoe UI Variable Text", size=12, weight="bold"))
+        search_label.grid(row=0, column=0, padx=(4, 6), pady=0)
         self.search_entry = ctk.CTkEntry(
             search_frame, 
             placeholder_text="輸入名稱或網址以進行過濾...",
             fg_color=self.c_sidebar,
             border_color=self.c_card_border,
             border_width=1,
+            height=34,
+            corner_radius=8,
             text_color=self.c_text_primary,
-            placeholder_text_color="#4f6668"
+            placeholder_text_color=self.c_text_muted
         )
         self.search_entry.grid(row=0, column=1, padx=4, pady=0, sticky="ew")
         self.search_entry.bind("<KeyRelease>", self.filter_channels)
@@ -410,11 +744,13 @@ class App(ctk.CTk):
         self.toggle_edit_btn = ctk.CTkButton(
             search_frame,
             text="🛠 隱藏設定面板",
-            fg_color="gray30",
-            hover_color="gray40",
+            fg_color="#1e293b",
+            hover_color="#334155",
             text_color=self.c_text_primary,
-            font=ctk.CTkFont(weight="bold"),
-            width=100,
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=12, weight="bold"),
+            height=34,
+            corner_radius=8,
+            width=110,
             command=self.toggle_edit_panel
         )
         self.toggle_edit_btn.grid(row=0, column=2, padx=(10, 4), pady=0)
@@ -422,7 +758,7 @@ class App(ctk.CTk):
         
         # Channels Scrollable Frame
         self.channels_scroll_frame = NativeScrollableFrame(list_panel, self.c_frame)
-        self.channels_scroll_frame.grid(row=1, column=0, padx=12, pady=(0, 16), sticky="nsew")
+        self.channels_scroll_frame.grid(row=2, column=0, padx=12, pady=(0, 12), sticky="nsew")
         
         # Channel Card Container
         self.channel_cards = [] 
@@ -441,8 +777,8 @@ class App(ctk.CTk):
         edit_panel.grid_columnconfigure(0, weight=1)
         self.edit_panel = edit_panel
         
-        title_label = ctk.CTkLabel(edit_panel, text="🛠 頻道屬性設定", font=ctk.CTkFont(size=16, weight="bold"), text_color=self.c_text_primary)
-        title_label.grid(row=0, column=0, padx=16, pady=16, sticky="w")
+        title_label = ctk.CTkLabel(edit_panel, text="🛠 頻道屬性設定", font=ctk.CTkFont(family="Segoe UI Variable Text", size=15, weight="bold"), text_color=self.c_text_primary)
+        title_label.grid(row=0, column=0, padx=16, pady=(16, 12), sticky="w")
         
         # Form Fields
         fields_frame = ctk.CTkFrame(edit_panel, fg_color="transparent")
@@ -450,35 +786,39 @@ class App(ctk.CTk):
         fields_frame.grid_columnconfigure(1, weight=1)
         
         # Name
-        lbl1 = ctk.CTkLabel(fields_frame, text="顯示名稱 (ID):", text_color=self.c_text_secondary, font=ctk.CTkFont(size=12))
+        lbl1 = ctk.CTkLabel(fields_frame, text="顯示名稱 (ID):", text_color=self.c_text_secondary, font=ctk.CTkFont(family="Segoe UI Variable Text", size=12))
         lbl1.grid(row=0, column=0, padx=4, pady=5, sticky="w")
         self.chan_name_entry = ctk.CTkEntry(
             fields_frame, 
             placeholder_text="例如: セラ",
             fg_color=self.c_sidebar,
             border_color=self.c_card_border,
+            height=34,
+            corner_radius=6,
             text_color=self.c_text_primary,
-            placeholder_text_color="#4f6668"
+            placeholder_text_color=self.c_text_muted
         )
         self.chan_name_entry.grid(row=0, column=1, padx=4, pady=5, sticky="ew")
         
         # URL
-        lbl2 = ctk.CTkLabel(fields_frame, text="頻道網址 (URL):", text_color=self.c_text_secondary, font=ctk.CTkFont(size=12))
+        lbl2 = ctk.CTkLabel(fields_frame, text="頻道網址 (URL):", text_color=self.c_text_secondary, font=ctk.CTkFont(family="Segoe UI Variable Text", size=12))
         lbl2.grid(row=1, column=0, padx=4, pady=5, sticky="w")
         self.chan_url_entry = ctk.CTkEntry(
             fields_frame, 
             placeholder_text="輸入頻道直播或首頁網址...",
             fg_color=self.c_sidebar,
             border_color=self.c_card_border,
+            height=34,
+            corner_radius=6,
             text_color=self.c_text_primary,
-            placeholder_text_color="#4f6668"
+            placeholder_text_color=self.c_text_muted
         )
         self.chan_url_entry.grid(row=1, column=1, padx=4, pady=5, sticky="ew")
         self.chan_url_entry.bind("<KeyRelease>", self.on_chan_url_keyrelease)
         
         # Detected platform badge
-        self.chan_platform_badge = ctk.CTkLabel(fields_frame, text="平台識別：未知 ⚪", font=ctk.CTkFont(weight="bold"), text_color=self.c_text_secondary)
-        self.chan_platform_badge.grid(row=2, column=0, columnspan=2, padx=4, pady=8, sticky="w")
+        self.chan_platform_badge = ctk.CTkLabel(fields_frame, text="平台識別：未知 ⚪", font=ctk.CTkFont(family="Segoe UI Variable Text", size=12, weight="bold"), text_color=self.c_text_secondary)
+        self.chan_platform_badge.grid(row=2, column=0, columnspan=2, padx=4, pady=6, sticky="w")
         
         # Archive Enable Toggle
         self.chan_record_var = ctk.BooleanVar(value=True)
@@ -487,45 +827,48 @@ class App(ctk.CTk):
             text="啟用自動錄影功能", 
             variable=self.chan_record_var,
             text_color=self.c_text_primary,
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=12, weight="bold"),
             progress_color=self.c_accent,
             button_color=self.c_text_primary,
             button_hover_color=self.c_accent_hover
         )
-        self.chan_record_switch.grid(row=3, column=0, columnspan=2, padx=4, pady=8, sticky="w")
+        self.chan_record_switch.grid(row=3, column=0, columnspan=2, padx=4, pady=6, sticky="w")
         
         # Cover image URL
-        lbl3 = ctk.CTkLabel(fields_frame, text="封面圖片網址:", text_color=self.c_text_secondary, font=ctk.CTkFont(size=12))
+        lbl3 = ctk.CTkLabel(fields_frame, text="封面圖片網址:", text_color=self.c_text_secondary, font=ctk.CTkFont(family="Segoe UI Variable Text", size=12))
         lbl3.grid(row=4, column=0, padx=4, pady=5, sticky="w")
         self.chan_image_entry = ctk.CTkEntry(
             fields_frame, 
             placeholder_text="網址 (用於 Discord 通知)...",
             fg_color=self.c_sidebar,
             border_color=self.c_card_border,
+            height=34,
+            corner_radius=6,
             text_color=self.c_text_primary,
-            placeholder_text_color="#4f6668"
+            placeholder_text_color=self.c_text_muted
         )
         self.chan_image_entry.grid(row=4, column=1, padx=4, pady=5, sticky="ew")
         self.chan_image_entry.bind("<KeyRelease>", self.on_chan_image_keyrelease)
         
         # Image Preview Area
         preview_group = ctk.CTkFrame(edit_panel, fg_color=self.c_sidebar, border_color=self.c_card_border, border_width=1, corner_radius=8)
-        preview_group.grid(row=2, column=0, padx=16, pady=16, sticky="nsew")
+        preview_group.grid(row=2, column=0, padx=16, pady=12, sticky="nsew")
         preview_group.grid_rowconfigure(1, weight=1)
         preview_group.grid_columnconfigure(0, weight=1)
         
         ctk.CTkLabel(
             preview_group, 
             text="🖼 封面預覽", 
-            font=ctk.CTkFont(size=12, weight="bold"),
-            text_color=self.c_text_primary
-        ).grid(row=0, column=0, padx=12, pady=6, sticky="w")
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=11, weight="bold"),
+            text_color=self.c_text_muted
+        ).grid(row=0, column=0, padx=10, pady=4, sticky="w")
         
-        self.image_preview_label = ctk.CTkLabel(preview_group, text="無圖片預覽", text_color=self.c_text_secondary)
-        self.image_preview_label.grid(row=1, column=0, padx=12, pady=12, sticky="nsew")
+        self.image_preview_label = ctk.CTkLabel(preview_group, text="無圖片預覽", text_color=self.c_text_secondary, font=ctk.CTkFont(family="Segoe UI Variable Text", size=11))
+        self.image_preview_label.grid(row=1, column=0, padx=10, pady=10, sticky="nsew")
         
         # Action Buttons for Editing Panel
         btn_frame = ctk.CTkFrame(edit_panel, fg_color="transparent")
-        btn_frame.grid(row=3, column=0, padx=16, pady=4, sticky="ew")
+        btn_frame.grid(row=3, column=0, padx=16, pady=3, sticky="ew")
         btn_frame.grid_columnconfigure(0, weight=1)
         btn_frame.grid_columnconfigure(1, weight=1)
         
@@ -533,11 +876,13 @@ class App(ctk.CTk):
             btn_frame, 
             text="✨ 新增頻道", 
             fg_color=self.c_green, 
-            hover_color="#0fa472", 
-            font=ctk.CTkFont(weight="bold"),
+            hover_color="#059669", 
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=12, weight="bold"),
+            height=34,
+            corner_radius=6,
             command=self.add_channel
         )
-        self.add_chan_btn.grid(row=0, column=0, padx=4, pady=4, sticky="ew")
+        self.add_chan_btn.grid(row=0, column=0, padx=3, pady=3, sticky="ew")
         
         self.update_chan_btn = ctk.CTkButton(
             btn_frame, 
@@ -545,13 +890,15 @@ class App(ctk.CTk):
             state="disabled", 
             fg_color=self.c_accent,
             hover_color=self.c_accent_hover,
-            font=ctk.CTkFont(weight="bold"),
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=12, weight="bold"),
+            height=34,
+            corner_radius=6,
             command=self.update_channel
         )
-        self.update_chan_btn.grid(row=0, column=1, padx=4, pady=4, sticky="ew")
+        self.update_chan_btn.grid(row=0, column=1, padx=3, pady=3, sticky="ew")
         
         btn_frame2 = ctk.CTkFrame(edit_panel, fg_color="transparent")
-        btn_frame2.grid(row=4, column=0, padx=16, pady=4, sticky="ew")
+        btn_frame2.grid(row=4, column=0, padx=16, pady=3, sticky="ew")
         btn_frame2.grid_columnconfigure(0, weight=1)
         btn_frame2.grid_columnconfigure(1, weight=1)
         
@@ -559,32 +906,37 @@ class App(ctk.CTk):
             btn_frame2, 
             text="🗑 刪除選取", 
             fg_color=self.c_red, 
-            hover_color="#db3b3b", 
-            font=ctk.CTkFont(weight="bold"),
+            hover_color="#e11d48", 
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=12, weight="bold"),
+            height=34,
+            corner_radius=6,
             state="disabled", 
             command=self.delete_channel
         )
-        self.delete_chan_btn.grid(row=0, column=0, padx=4, pady=4, sticky="ew")
+        self.delete_chan_btn.grid(row=0, column=0, padx=3, pady=3, sticky="ew")
         
         self.clear_chan_btn = ctk.CTkButton(
             btn_frame2, 
             text="🧹 清空輸入", 
-            fg_color="gray30", 
-            hover_color="gray40", 
+            fg_color="#1e293b", 
+            hover_color="#334155", 
             text_color=self.c_text_primary,
-            font=ctk.CTkFont(weight="bold"),
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=12, weight="bold"),
+            height=34,
+            corner_radius=6,
             command=self.clear_channel_form
         )
-        self.clear_chan_btn.grid(row=0, column=1, padx=4, pady=4, sticky="ew")
+        self.clear_chan_btn.grid(row=0, column=1, padx=3, pady=3, sticky="ew")
         
         # Save Channels button at bottom
         self.save_chans_btn = ctk.CTkButton(
             edit_panel, 
             text="💾 儲存寫入 channels.json", 
-            height=40, 
-            font=ctk.CTkFont(size=13, weight="bold"), 
-            fg_color="#009688", 
-            hover_color="#00796b", 
+            height=38, 
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=13, weight="bold"), 
+            fg_color=self.c_accent, 
+            hover_color=self.c_accent_hover,
+            corner_radius=8,
             command=self.write_channels_file
         )
         self.save_chans_btn.grid(row=6, column=0, padx=16, pady=16, sticky="ew")
@@ -635,6 +987,21 @@ class App(ctk.CTk):
         # Rebuild cards in sorted order (active first, then inactive)
         sorted_list = active_chans + inactive_chans
         
+        # Update Dashboard Top KPI Telemetry
+        live_count = sum(1 for _, _, state, is_act in sorted_list if is_act or "錄影中" in state or "下載中" in state)
+        active_task_count = len([t for t in self.active_tasks.values() if t.get("status") != "監控中"])
+        if hasattr(self, "kpi_total_chan"):
+            self.kpi_total_chan.configure(text=f"{len(self.channels)} 個")
+        if hasattr(self, "kpi_live_chan"):
+            self.kpi_live_chan.configure(text=f"{live_count} 個", text_color=self.c_green_text if live_count > 0 else self.c_text_muted)
+        if hasattr(self, "kpi_active_tasks"):
+            self.kpi_active_tasks.configure(text=f"{active_task_count} 個", text_color=self.c_blue_text if active_task_count > 0 else self.c_text_muted)
+        if hasattr(self, "kpi_sys_status"):
+            self.kpi_sys_status.configure(
+                text="● 監控中" if self.is_monitoring else "○ 待機中", 
+                text_color=self.c_green_text if self.is_monitoring else self.c_text_muted
+            )
+        
         # Destroy cards that are no longer in the filtered list
         if not hasattr(self, "channel_card_widgets"):
             self.channel_card_widgets = {}
@@ -666,19 +1033,19 @@ class App(ctk.CTk):
             plat_color, plat_bg = self.platform_colors.get(platform, (self.c_text_secondary, self.c_card))
             if channel_state in ["錄影中", "下載中"]:
                 rec_text = f"🔴 {channel_state}"
-                rec_color = self.c_red
+                rec_color = self.c_red_text
                 rec_bg = self.c_red_bg
             elif is_active_download or "監控中" in channel_state:
                 rec_text = f"🟢 {channel_state}"
-                rec_color = self.c_green
+                rec_color = self.c_green_text
                 rec_bg = self.c_green_bg
             else:
                 rec_text = "REC ON" if channel["record"] else "NOTIFY"
-                rec_color = self.c_green
-                rec_bg = self.c_green_bg
+                rec_color = self.c_green_text if channel["record"] else self.c_text_muted
+                rec_bg = self.c_green_bg if channel["record"] else self.c_sidebar
                 
             card_fg = self.c_card_selected if idx_in_channels == self.selected_channel_index else self.c_card
-            card_border = self.c_accent if idx_in_channels == self.selected_channel_index else self.c_card_border
+            card_border = self.c_card_selected_border if idx_in_channels == self.selected_channel_index else self.c_card_border
             
             if url in self.channel_card_widgets:
                 # Update existing widgets in-place
@@ -694,7 +1061,7 @@ class App(ctk.CTk):
                 card_info["url_label"].configure(text=url_subtitle, bg=card_fg)
                 
                 card_info["plat_badge"].configure(text=platform.upper(), bg=plat_bg, fg=plat_color)
-                card_info["rec_badge"].configure(text=rec_text, bg=rec_bg, fg=rec_color, width=16 if (is_active_download or "監控中" in channel_state) else 9)
+                card_info["rec_badge"].configure(text=rec_text, bg=rec_bg, fg=rec_color)
                 
                 card_info["thumb_container"].configure(bg=self.c_sidebar)
                 
@@ -728,9 +1095,9 @@ class App(ctk.CTk):
                 card.grid_columnconfigure(1, weight=1)
                 
                 # 1. Left Thumbnail
-                thumb_container = tk.Frame(card, width=45, height=45, bg=self.c_sidebar)
+                thumb_container = tk.Frame(card, width=44, height=44, bg=self.c_sidebar)
                 thumb_container.grid_propagate(False)
-                thumb_container.grid(row=0, column=0, rowspan=2, padx=(12, 6), pady=12)
+                thumb_container.grid(row=0, column=0, rowspan=2, padx=(10, 8), pady=10)
                 
                 thumbnail_label = tk.Label(thumb_container, text="", bg=self.c_sidebar, fg=self.c_text_primary)
                 thumbnail_label.pack(expand=True, fill="both")
@@ -754,12 +1121,12 @@ class App(ctk.CTk):
                 name_label = tk.Label(
                     card, 
                     text=channel["name"], 
-                    font=("Microsoft JhengHei", 11, "bold"),
+                    font=("Segoe UI Variable Text", 10, "bold"),
                     bg=card_fg,
                     fg=self.c_text_primary,
                     anchor="w"
                 )
-                name_label.grid(row=0, column=1, padx=(6, 12), pady=(12, 2), sticky="w")
+                name_label.grid(row=0, column=1, padx=(4, 10), pady=(10, 2), sticky="w")
                 
                 url_subtitle = channel["url"]
                 if len(url_subtitle) > 42:
@@ -767,12 +1134,12 @@ class App(ctk.CTk):
                 url_label = tk.Label(
                     card, 
                     text=url_subtitle, 
-                    font=("Microsoft JhengHei", 9),
+                    font=("Segoe UI Variable Text", 9),
                     bg=card_fg,
                     fg=self.c_text_secondary,
                     anchor="w"
                 )
-                url_label.grid(row=1, column=1, padx=(6, 12), pady=(2, 12), sticky="w")
+                url_label.grid(row=1, column=1, padx=(4, 10), pady=(2, 10), sticky="w")
                 
                 # 3. Platform Badge
                 plat_badge = tk.Label(
@@ -780,12 +1147,12 @@ class App(ctk.CTk):
                     text=platform.upper(), 
                     bg=plat_bg,
                     fg=plat_color, 
-                    font=("Microsoft JhengHei", 8, "bold"),
-                    width=10,
-                    height=1,
+                    font=("Segoe UI Variable Text", 8, "bold"),
+                    padx=8,
+                    pady=3,
                     relief="flat"
                 )
-                plat_badge.grid(row=0, column=2, rowspan=2, padx=10, pady=12)
+                plat_badge.grid(row=0, column=2, rowspan=2, padx=6, pady=10)
                 
                 # 4. Record Badge
                 rec_badge = tk.Label(
@@ -793,12 +1160,12 @@ class App(ctk.CTk):
                     text=rec_text, 
                     bg=rec_bg,
                     fg=rec_color, 
-                    font=("Microsoft JhengHei", 8, "bold"),
-                    width=16 if (is_active_download or "監控中" in channel_state) else 9,
-                    height=1,
+                    font=("Segoe UI Variable Text", 8, "bold"),
+                    padx=8,
+                    pady=3,
                     relief="flat"
                 )
-                rec_badge.grid(row=0, column=3, rowspan=2, padx=10, pady=12)
+                rec_badge.grid(row=0, column=3, rowspan=2, padx=(4, 10), pady=10)
                 
                 # Selection bindings using URL instead of index to prevent index shifts
                 for widget in [card, name_label, url_label, thumbnail_label]:
@@ -814,7 +1181,7 @@ class App(ctk.CTk):
                     "rec_badge": rec_badge
                 }
                 
-            card.pack(fill="x", padx=5, pady=5)
+            card.pack(fill="x", padx=4, pady=3)
             self.channel_cards.append(card)
 
     def select_channel_row(self, index):
@@ -839,7 +1206,7 @@ class App(ctk.CTk):
             if card_info:
                 card = card_info["card"]
                 bg_col = self.c_card_selected if i == index else self.c_card
-                border_col = self.c_accent if i == index else self.c_card_border
+                border_col = self.c_card_selected_border if i == index else self.c_card_border
                 card.configure(bg=bg_col, highlightbackground=border_col)
                 card_info["name_label"].configure(bg=bg_col)
                 card_info["url_label"].configure(bg=bg_col)
@@ -1022,9 +1389,9 @@ class App(ctk.CTk):
         
         # Header Area
         header_frame = ctk.CTkFrame(tasks_frame, fg_color="transparent")
-        header_frame.grid(row=0, column=0, padx=15, pady=(10, 15), sticky="ew")
+        header_frame.grid(row=0, column=0, padx=12, pady=(10, 15), sticky="ew")
         
-        ctk.CTkLabel(header_frame, text="📥 正在下載的任務", font=ctk.CTkFont(size=18, weight="bold"), text_color=self.c_text_primary).pack(side="left")
+        ctk.CTkLabel(header_frame, text="📥 正在下載的任務", font=ctk.CTkFont(family="Segoe UI Variable Text", size=16, weight="bold"), text_color=self.c_text_primary).pack(side="left")
         
         # Tasks Scrollable Area
         self.tasks_scroll_frame = ctk.CTkScrollableFrame(
@@ -1034,7 +1401,7 @@ class App(ctk.CTk):
             border_width=1, 
             corner_radius=12
         )
-        self.tasks_scroll_frame.grid(row=1, column=0, padx=15, pady=5, sticky="nsew")
+        self.tasks_scroll_frame.grid(row=1, column=0, padx=12, pady=5, sticky="nsew")
         self.tasks_scroll_frame.grid_columnconfigure(0, weight=1)
         
         self.task_ui_elements = {} # uid -> widgets dict
@@ -1044,7 +1411,7 @@ class App(ctk.CTk):
         active_download_tasks = {}
         for uid, task in self.active_tasks.items():
             status = task.get("status", "")
-            if status in ["錄影中", "下載中", "準備錄影", "解析連線中...", "佇列中"]:
+            if status != "監控中":
                 active_download_tasks[uid] = task
                 
         active_count = len(active_download_tasks)
@@ -1067,7 +1434,7 @@ class App(ctk.CTk):
         if not active_download_tasks:
             # Clear scrollable frame children if not already cleared
             if not self.tasks_scroll_frame.winfo_children():
-                lbl = ctk.CTkLabel(self.tasks_scroll_frame, text="目前沒有進行中的下載任務", text_color=self.c_text_secondary, font=ctk.CTkFont(size=14))
+                lbl = ctk.CTkLabel(self.tasks_scroll_frame, text="目前沒有進行中的下載任務", text_color=self.c_text_muted, font=ctk.CTkFont(family="Segoe UI Variable Text", size=13))
                 lbl.pack(pady=40)
             return
             
@@ -1086,7 +1453,7 @@ class App(ctk.CTk):
                     border_width=1,
                     corner_radius=8
                 )
-                row_frame.pack(fill="x", padx=5, pady=5)
+                row_frame.pack(fill="x", padx=4, pady=4)
                 row_frame.grid_columnconfigure(2, weight=1)
                 
                 # Platform outline badge
@@ -1097,24 +1464,24 @@ class App(ctk.CTk):
                     text=plat.upper(), 
                     fg_color=p_bg,
                     text_color=p_color, 
-                    corner_radius=4,
+                    corner_radius=6,
                     width=75,
                     height=22,
-                    font=ctk.CTkFont(size=9, weight="bold")
+                    font=ctk.CTkFont(family="Segoe UI Variable Text", size=9, weight="bold")
                 )
-                plat_lbl.grid(row=0, column=0, padx=15, pady=15)
+                plat_lbl.grid(row=0, column=0, padx=12, pady=12)
                 
                 # Task Channel Name
-                name_lbl = ctk.CTkLabel(row_frame, text=task.get("channel_name", "Unknown"), font=ctk.CTkFont(weight="bold"), text_color=self.c_text_primary)
-                name_lbl.grid(row=0, column=1, padx=10, pady=15, sticky="w")
+                name_lbl = ctk.CTkLabel(row_frame, text=task.get("channel_name", "Unknown"), font=ctk.CTkFont(family="Segoe UI Variable Text", size=12, weight="bold"), text_color=self.c_text_primary)
+                name_lbl.grid(row=0, column=1, padx=8, pady=12, sticky="w")
                 
                 # Stats / Speed Label
-                stats_lbl = ctk.CTkLabel(row_frame, text="佇列中...", text_color=self.c_text_secondary, font=ctk.CTkFont(size=12))
-                stats_lbl.grid(row=0, column=2, padx=15, pady=15, sticky="e")
+                stats_lbl = ctk.CTkLabel(row_frame, text="佇列中...", text_color=self.c_text_secondary, font=ctk.CTkFont(family="Segoe UI Variable Text", size=11))
+                stats_lbl.grid(row=0, column=2, padx=12, pady=12, sticky="e")
                 
                 # Progress Bar
-                prog_bar = ctk.CTkProgressBar(row_frame, width=200, progress_color=self.c_accent)
-                prog_bar.grid(row=0, column=3, padx=15, pady=15)
+                prog_bar = ctk.CTkProgressBar(row_frame, width=190, height=8, corner_radius=4, progress_color=self.c_accent, fg_color=self.c_sidebar)
+                prog_bar.grid(row=0, column=3, padx=12, pady=12)
                 prog_bar.set(0)
                 
                 # Kill Button
@@ -1122,12 +1489,14 @@ class App(ctk.CTk):
                     row_frame, 
                     text="✖ 停止", 
                     width=65, 
+                    height=28,
+                    corner_radius=6,
                     fg_color=self.c_red, 
-                    hover_color="#db3b3b", 
-                    font=ctk.CTkFont(weight="bold"),
+                    hover_color="#e11d48", 
+                    font=ctk.CTkFont(family="Segoe UI Variable Text", size=11, weight="bold"),
                     command=lambda u=uid: self.kill_active_task(u)
                 )
-                kill_btn.grid(row=0, column=4, padx=15, pady=15)
+                kill_btn.grid(row=0, column=4, padx=12, pady=12)
                 
                 self.task_ui_elements[uid] = {
                     "widgets": [row_frame, plat_lbl, name_lbl, stats_lbl, prog_bar, kill_btn],
@@ -1187,9 +1556,23 @@ class App(ctk.CTk):
         
         # Header
         header_frame = ctk.CTkFrame(hist_frame, fg_color="transparent")
-        header_frame.grid(row=0, column=0, padx=15, pady=(10, 15), sticky="ew")
+        header_frame.grid(row=0, column=0, padx=12, pady=(10, 15), sticky="ew")
         
-        ctk.CTkLabel(header_frame, text="📜 已完成的歷史紀錄 (近500筆)", font=ctk.CTkFont(size=18, weight="bold"), text_color=self.c_text_primary).pack(side="left")
+        ctk.CTkLabel(header_frame, text="📜 已完成的歷史紀錄 (近500筆)", font=ctk.CTkFont(family="Segoe UI Variable Text", size=16, weight="bold"), text_color=self.c_text_primary).pack(side="left")
+        
+        self.btn_clear_history = ctk.CTkButton(
+            header_frame, 
+            text="🗑️ 清除歷史紀錄", 
+            width=110, 
+            height=30, 
+            fg_color=self.c_red, 
+            hover_color="#e11d48", 
+            text_color=self.c_text_primary,
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=12, weight="bold"),
+            corner_radius=6,
+            command=self.clear_history
+        )
+        self.btn_clear_history.pack(side="right", padx=5)
         
         # Scroll Area
         self.hist_scroll_frame = ctk.CTkScrollableFrame(
@@ -1199,15 +1582,25 @@ class App(ctk.CTk):
             border_width=1, 
             corner_radius=12
         )
-        self.hist_scroll_frame.grid(row=1, column=0, padx=15, pady=5, sticky="nsew")
+        self.hist_scroll_frame.grid(row=1, column=0, padx=12, pady=5, sticky="nsew")
         self.hist_scroll_frame.grid_columnconfigure(2, weight=1)
+
+    def clear_history(self):
+        if not self.history:
+            messagebox.showinfo("提示", "目前沒有下載歷史紀錄可以清除。")
+            return
+            
+        ans = messagebox.askyesno("確認清除", "確定要清除所有的下載歷史紀錄嗎？\n(這不會刪除任何已下載的影片檔案)")
+        if ans:
+            if database.clear_history(self):
+                self.add_log("已成功清除下載歷史紀錄", "SUCCESS")
 
     def refresh_history_ui(self):
         for widget in self.hist_scroll_frame.winfo_children():
             widget.destroy()
             
         if not self.history:
-            ctk.CTkLabel(self.hist_scroll_frame, text="尚無已完成的下載歷史紀錄", text_color=self.c_text_secondary, font=ctk.CTkFont(size=14)).pack(pady=40)
+            ctk.CTkLabel(self.hist_scroll_frame, text="尚無已完成的下載歷史紀錄", text_color=self.c_text_muted, font=ctk.CTkFont(family="Segoe UI Variable Text", size=13)).pack(pady=40)
             return
             
         for entry in self.history:
@@ -1218,7 +1611,7 @@ class App(ctk.CTk):
                 border_width=1,
                 corner_radius=8
             )
-            row_frame.pack(fill="x", padx=5, pady=5)
+            row_frame.pack(fill="x", padx=4, pady=4)
             row_frame.grid_columnconfigure(2, weight=1)
             
             # Platform Badge
@@ -1229,36 +1622,36 @@ class App(ctk.CTk):
                 text=plat.upper(), 
                 fg_color=p_bg,
                 text_color=p_color, 
-                corner_radius=4,
+                corner_radius=6,
                 width=75,
                 height=22,
-                font=ctk.CTkFont(size=9, weight="bold")
+                font=ctk.CTkFont(family="Segoe UI Variable Text", size=9, weight="bold")
             )
-            plat_badge.grid(row=0, column=0, padx=15, pady=12)
+            plat_badge.grid(row=0, column=0, padx=12, pady=10)
             
             # Channel Details Stack
             left_info_frame = ctk.CTkFrame(row_frame, fg_color="transparent")
             left_info_frame.grid(row=0, column=1, padx=5, pady=5, sticky="w")
             
-            chan_lbl = ctk.CTkLabel(left_info_frame, text=entry.get("channel", "Unknown"), font=ctk.CTkFont(size=13, weight="bold"), text_color=self.c_text_primary)
+            chan_lbl = ctk.CTkLabel(left_info_frame, text=entry.get("channel", "Unknown"), font=ctk.CTkFont(family="Segoe UI Variable Text", size=12, weight="bold"), text_color=self.c_text_primary)
             chan_lbl.pack(anchor="w")
-            time_lbl = ctk.CTkLabel(left_info_frame, text=entry.get("timestamp", ""), font=ctk.CTkFont(size=11), text_color=self.c_text_secondary)
+            time_lbl = ctk.CTkLabel(left_info_frame, text=entry.get("timestamp", ""), font=ctk.CTkFont(family="Segoe UI Variable Text", size=10), text_color=self.c_text_muted)
             time_lbl.pack(anchor="w")
             
             # Video Title
             v_title = entry.get("title", "未命名標題")
             if len(v_title) > 60:
                 v_title = v_title[:57] + "..."
-            title_lbl = ctk.CTkLabel(row_frame, text=v_title, font=ctk.CTkFont(size=13), text_color=self.c_text_primary)
-            title_lbl.grid(row=0, column=2, padx=15, pady=12, sticky="w")
+            title_lbl = ctk.CTkLabel(row_frame, text=v_title, font=ctk.CTkFont(family="Segoe UI Variable Text", size=12), text_color=self.c_text_primary)
+            title_lbl.grid(row=0, column=2, padx=12, pady=10, sticky="w")
             
             # Size Label
-            size_lbl = ctk.CTkLabel(row_frame, text=entry.get("size", "Unknown"), font=ctk.CTkFont(size=12), text_color=self.c_text_secondary)
-            size_lbl.grid(row=0, column=3, padx=15, pady=12)
+            size_lbl = ctk.CTkLabel(row_frame, text=entry.get("size", "Unknown"), font=ctk.CTkFont(family="Segoe UI Variable Text", size=11), text_color=self.c_text_secondary)
+            size_lbl.grid(row=0, column=3, padx=12, pady=10)
             
             # Quick Actions Frame
             act_frame = ctk.CTkFrame(row_frame, fg_color="transparent")
-            act_frame.grid(row=0, column=4, padx=15, pady=12, sticky="e")
+            act_frame.grid(row=0, column=4, padx=12, pady=10, sticky="e")
             
             path = entry.get("file_path", "")
             
@@ -1267,10 +1660,11 @@ class App(ctk.CTk):
                 text="📂 資料夾", 
                 width=65, 
                 height=26, 
-                fg_color="gray30", 
-                hover_color="gray40", 
+                fg_color="#1e293b", 
+                hover_color="#334155", 
                 text_color=self.c_text_primary,
-                font=ctk.CTkFont(size=11, weight="bold"),
+                corner_radius=6,
+                font=ctk.CTkFont(family="Segoe UI Variable Text", size=11, weight="bold"),
                 command=lambda p=path: self.open_containing_folder(p)
             )
             open_btn.pack(side="left", padx=4)
@@ -1283,7 +1677,8 @@ class App(ctk.CTk):
                 fg_color=self.c_accent, 
                 hover_color=self.c_accent_hover,
                 text_color=self.c_text_primary,
-                font=ctk.CTkFont(size=11, weight="bold"),
+                corner_radius=6,
+                font=ctk.CTkFont(family="Segoe UI Variable Text", size=11, weight="bold"),
                 command=lambda p=path: self.play_video(p)
             )
             play_btn.pack(side="left", padx=4)
@@ -1324,23 +1719,23 @@ class App(ctk.CTk):
         
         # Header
         header_frame = ctk.CTkFrame(manual_frame, fg_color="transparent")
-        header_frame.grid(row=0, column=0, padx=15, pady=(10, 15), sticky="ew")
+        header_frame.grid(row=0, column=0, padx=12, pady=(10, 15), sticky="ew")
         
-        ctk.CTkLabel(header_frame, text="🔗 指派單次影音手動下載任務", font=ctk.CTkFont(size=18, weight="bold"), text_color=self.c_text_primary).pack(side="left")
+        ctk.CTkLabel(header_frame, text="🔗 指派單次影音手動下載任務", font=ctk.CTkFont(family="Segoe UI Variable Text", size=16, weight="bold"), text_color=self.c_text_primary).pack(side="left")
         
         # Content frame
         content_box = ctk.CTkFrame(manual_frame, fg_color=self.c_frame, border_color=self.c_card_border, border_width=1, corner_radius=12)
-        content_box.grid(row=1, column=0, padx=15, pady=5, sticky="nsew")
+        content_box.grid(row=1, column=0, padx=12, pady=5, sticky="nsew")
         content_box.grid_columnconfigure(1, weight=1)
         content_box.grid_rowconfigure(5, weight=1)
         
-        form_label_font = ctk.CTkFont(size=13, weight="bold")
+        form_label_font = ctk.CTkFont(family="Segoe UI Variable Text", size=12, weight="bold")
         
         # URL Field
-        ctk.CTkLabel(content_box, text="影音網址 (URL):", text_color=self.c_text_secondary, font=form_label_font).grid(row=0, column=0, padx=25, pady=(25, 10), sticky="w")
+        ctk.CTkLabel(content_box, text="影音網址 (URL):", text_color=self.c_text_secondary, font=form_label_font).grid(row=0, column=0, padx=20, pady=(20, 8), sticky="w")
         
         url_container = ctk.CTkFrame(content_box, fg_color="transparent")
-        url_container.grid(row=0, column=1, columnspan=2, padx=25, pady=(25, 10), sticky="ew")
+        url_container.grid(row=0, column=1, columnspan=2, padx=20, pady=(20, 8), sticky="ew")
         url_container.grid_columnconfigure(0, weight=1)
         
         self.manual_url_entry = ctk.CTkEntry(
@@ -1348,28 +1743,32 @@ class App(ctk.CTk):
             placeholder_text="輸入單個直播、影片、YouTube 網址...",
             fg_color=self.c_sidebar,
             border_color=self.c_card_border,
+            height=34,
+            corner_radius=8,
             text_color=self.c_text_primary,
-            placeholder_text_color="#4f6668"
+            placeholder_text_color=self.c_text_muted
         )
         self.manual_url_entry.grid(row=0, column=0, padx=(0, 10), pady=0, sticky="ew")
         
         load_txt_btn = ctk.CTkButton(
             url_container,
             text="📁 載入 TXT...",
-            width=90,
-            fg_color="gray30",
-            hover_color="gray40",
+            width=95,
+            height=34,
+            fg_color="#1e293b",
+            hover_color="#334155",
             text_color=self.c_text_primary,
-            font=ctk.CTkFont(weight="bold"),
+            corner_radius=6,
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=12, weight="bold"),
             command=self.load_manual_urls_from_txt
         )
         load_txt_btn.grid(row=0, column=1, padx=0, pady=0)
         
         # Custom Subfolder Field
-        ctk.CTkLabel(content_box, text="儲存資料夾名稱/路徑:", text_color=self.c_text_secondary, font=form_label_font).grid(row=1, column=0, padx=25, pady=10, sticky="w")
+        ctk.CTkLabel(content_box, text="儲存資料夾名稱/路徑:", text_color=self.c_text_secondary, font=form_label_font).grid(row=1, column=0, padx=20, pady=8, sticky="w")
         
         subfolder_container = ctk.CTkFrame(content_box, fg_color="transparent")
-        subfolder_container.grid(row=1, column=1, columnspan=2, padx=25, pady=10, sticky="ew")
+        subfolder_container.grid(row=1, column=1, columnspan=2, padx=20, pady=8, sticky="ew")
         subfolder_container.grid_columnconfigure(0, weight=1)
         
         self.manual_name_entry = ctk.CTkEntry(
@@ -1377,8 +1776,10 @@ class App(ctk.CTk):
             placeholder_text="例如: セラ (預設儲存資料夾名稱)，或瀏覽選取實體路徑...",
             fg_color=self.c_sidebar,
             border_color=self.c_card_border,
+            height=34,
+            corner_radius=8,
             text_color=self.c_text_primary,
-            placeholder_text_color="#4f6668"
+            placeholder_text_color=self.c_text_muted
         )
         self.manual_name_entry.grid(row=0, column=0, padx=(0, 10), pady=0, sticky="ew")
         
@@ -1386,16 +1787,18 @@ class App(ctk.CTk):
             subfolder_container, 
             text="瀏覽...", 
             width=80, 
-            fg_color="gray30", 
-            hover_color="gray40", 
+            height=34,
+            fg_color="#1e293b", 
+            hover_color="#334155", 
             text_color=self.c_text_primary,
-            font=ctk.CTkFont(weight="bold"),
+            corner_radius=6,
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=12, weight="bold"),
             command=self.browse_manual_download_directory
         )
         browse_dir_btn.grid(row=0, column=1, padx=0, pady=0)
         
         # Platform Selection Dropdown
-        ctk.CTkLabel(content_box, text="指定平台:", text_color=self.c_text_secondary, font=form_label_font).grid(row=2, column=0, padx=25, pady=10, sticky="w")
+        ctk.CTkLabel(content_box, text="指定平台:", text_color=self.c_text_secondary, font=form_label_font).grid(row=2, column=0, padx=20, pady=8, sticky="w")
         self.manual_platform_var = ctk.StringVar(value="自動偵測")
         self.manual_plat_menu = ctk.CTkOptionMenu(
             content_box,
@@ -1406,15 +1809,18 @@ class App(ctk.CTk):
             button_hover_color=self.c_accent_hover,
             dropdown_fg_color=self.c_sidebar,
             dropdown_text_color=self.c_text_primary,
-            dropdown_hover_color=self.c_accent_hover
+            dropdown_hover_color="#1e293b",
+            height=32,
+            corner_radius=6,
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=12)
         )
-        self.manual_plat_menu.grid(row=2, column=1, padx=25, pady=10, sticky="w")
+        self.manual_plat_menu.grid(row=2, column=1, padx=20, pady=8, sticky="w")
         
         # Quality & Format Selection for Manual Download
-        ctk.CTkLabel(content_box, text="畫質與格式選擇:", text_color=self.c_text_secondary, font=form_label_font).grid(row=3, column=0, padx=25, pady=10, sticky="w")
+        ctk.CTkLabel(content_box, text="畫質與格式選擇:", text_color=self.c_text_secondary, font=form_label_font).grid(row=3, column=0, padx=20, pady=8, sticky="w")
         
         qf_container = ctk.CTkFrame(content_box, fg_color="transparent")
-        qf_container.grid(row=3, column=1, columnspan=2, padx=25, pady=10, sticky="ew")
+        qf_container.grid(row=3, column=1, columnspan=2, padx=20, pady=8, sticky="ew")
         
         # Quality dropdown
         self.manual_quality_var = ctk.StringVar(value="best")
@@ -1423,12 +1829,15 @@ class App(ctk.CTk):
             variable=self.manual_quality_var,
             values=["best", "1080p", "720p", "480p", "360p", "worst"],
             width=100,
+            height=32,
+            corner_radius=6,
             fg_color=self.c_sidebar,
             button_color=self.c_accent,
             button_hover_color=self.c_accent_hover,
             dropdown_fg_color=self.c_sidebar,
             dropdown_text_color=self.c_text_primary,
-            dropdown_hover_color=self.c_accent_hover
+            dropdown_hover_color="#1e293b",
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=12)
         )
         self.manual_quality_menu.pack(side="left", padx=(0, 15))
         
@@ -1441,12 +1850,15 @@ class App(ctk.CTk):
             variable=self.manual_format_var,
             values=["mp4", "mkv", "webm", "ts"],
             width=100,
+            height=32,
+            corner_radius=6,
             fg_color=self.c_sidebar,
             button_color=self.c_accent,
             button_hover_color=self.c_accent_hover,
             dropdown_fg_color=self.c_sidebar,
             dropdown_text_color=self.c_text_primary,
-            dropdown_hover_color=self.c_accent_hover
+            dropdown_hover_color="#1e293b",
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=12)
         )
         self.manual_format_menu.pack(side="left")
         
@@ -1454,29 +1866,108 @@ class App(ctk.CTk):
         self.manual_dl_btn = ctk.CTkButton(
             content_box,
             text="📥 指派並開始下載任務",
-            height=45,
+            height=42,
             fg_color=self.c_green,
-            hover_color="#0fa472",
-            font=ctk.CTkFont(size=14, weight="bold"),
+            hover_color="#059669",
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=13, weight="bold"),
+            corner_radius=8,
             command=self.trigger_manual_download
         )
-        self.manual_dl_btn.grid(row=4, column=0, columnspan=3, padx=25, pady=25, sticky="ew")
+        self.manual_dl_btn.grid(row=4, column=0, columnspan=3, padx=20, pady=20, sticky="ew")
 
     def trigger_manual_download(self):
-        url = self.manual_url_entry.get().strip()
-        url = smart_redirect_url(url)
-        self.manual_url_entry.delete(0, 'end')
-        self.manual_url_entry.insert(0, url)
-        
-        custom_path = self.manual_name_entry.get().strip()
-        
-        if not url:
-            self.add_log("手動下載失敗: 影音網址不能為空！", "WARNING")
+        raw_input = self.manual_url_entry.get().strip()
+        if not raw_input:
+            self.add_log("手動下載失敗: 影音網址或 TXT 檔案路徑不能為空！", "WARNING")
             return
             
+        custom_path = self.manual_name_entry.get().strip()
         if not custom_path:
             custom_path = "Manual_Downloads"
             
+        quality = self.manual_quality_var.get()
+        fmt = self.manual_format_var.get()
+        
+        # Check if raw_input is a TXT file (either existing file or ends with .txt/.list)
+        is_txt_file = False
+        if os.path.isfile(raw_input) and not raw_input.startswith(('http://', 'https://')):
+            is_txt_file = True
+        elif raw_input.lower().endswith(('.txt', '.list')) and not raw_input.startswith(('http://', 'https://')):
+            is_txt_file = True
+            
+        if is_txt_file:
+            if not os.path.isfile(raw_input):
+                self.add_log(f"找不到 TXT 檔案: {raw_input}", "ERROR")
+                messagebox.showerror("錯誤", f"找不到 TXT 檔案：\n{raw_input}", parent=self)
+                return
+                
+            line_count = 0
+            first_url = ""
+            try:
+                with open(raw_input, 'rb') as f:
+                    raw_bytes = f.read()
+                content = ""
+                if raw_bytes.startswith(b'\xff\xfe') or raw_bytes.startswith(b'\xfe\xff'):
+                    try: content = raw_bytes.decode('utf-16')
+                    except: pass
+                elif raw_bytes.startswith(b'\xef\xbb\xbf'):
+                    try: content = raw_bytes.decode('utf-8-sig')
+                    except: pass
+                if not content:
+                    for enc in ('utf-8', 'utf-8-sig', 'cp950', 'big5', 'gb18030', 'utf-16', 'latin1'):
+                        try:
+                            content = raw_bytes.decode(enc)
+                            break
+                        except:
+                            continue
+                if not content:
+                    content = raw_bytes.decode('utf-8', errors='ignore')
+                    
+                for raw_l in content.splitlines():
+                    l = raw_l.strip()
+                    if l and not l.startswith(('#', '//')):
+                        line_count += 1
+                        if not first_url and ('http' in l or 'rplay' in l or 'youtube' in l or 'withny' in l or 'fc2' in l):
+                            first_url = l
+            except Exception as e:
+                self.add_log(f"讀取 TXT 檔案失敗: {e}", "ERROR")
+                messagebox.showerror("錯誤", f"讀取 TXT 檔案失敗: {e}", parent=self)
+                return
+                
+            plat = self.manual_platform_var.get()
+            if plat == "自動偵測":
+                plat = detect_platform(first_url or raw_input)
+                
+            display_name = os.path.basename(custom_path) if (":" in custom_path or "/" in custom_path or "\\" in custom_path) else custom_path
+            if not display_name:
+                display_name = os.path.basename(raw_input)
+                
+            uid = f"batch_{int(time.time())}_{random.randint(1000, 9999)}"
+            self.active_tasks[uid] = {
+                "channel_name": f"[批量排程] {display_name} ({line_count} 個項目)",
+                "platform": plat,
+                "url": raw_input,
+                "status": "排程下載中",
+                "progress": 0.0,
+                "speed": "",
+                "size": "",
+                "elapsed": "00:00",
+                "start_time": time.time(),
+                "process": None
+            }
+            self.refresh_tasks_ui()
+            self.select_tab("tasks")
+            self.add_log(f"已指派 TXT 批量排程任務: {raw_input} (共 {line_count} 個項目，由 yt-dlp 逐一下載)", "INFO")
+            
+            t = threading.Thread(target=workers.worker_manual_download, args=(self, uid, raw_input, custom_path, plat, quality, fmt), daemon=True)
+            t.start()
+            return
+            
+        # Single URL Workflow
+        url = smart_redirect_url(raw_input)
+        self.manual_url_entry.delete(0, 'end')
+        self.manual_url_entry.insert(0, url)
+        
         plat = self.manual_platform_var.get()
         if plat == "自動偵測":
             plat = detect_platform(url)
@@ -1485,7 +1976,6 @@ class App(ctk.CTk):
         if not display_name:
             display_name = "Manual_Download"
             
-        import random
         uid = f"manual_{int(time.time())}_{random.randint(1000, 9999)}"
         self.active_tasks[uid] = {
             "channel_name": f"[手動] {display_name}",
@@ -1503,9 +1993,35 @@ class App(ctk.CTk):
         self.add_log(f"已手動指派下載任務: {url}", "INFO")
         self.select_tab("tasks")
         
-        quality = self.manual_quality_var.get()
-        fmt = self.manual_format_var.get()
+        t = threading.Thread(target=workers.worker_manual_download, args=(self, uid, url, custom_path, plat, quality, fmt), daemon=True)
+        t.start()
+
+    def resume_paused_rplay_task(self, task_info):
+        if not task_info:
+            return
+        url = task_info.get("url")
+        custom_path = task_info.get("custom_path", "")
+        plat = task_info.get("platform", "Rplay")
+        quality = task_info.get("quality", "best")
+        fmt = task_info.get("fmt", "best")
+        display_name = task_info.get("display_name", "Rplay_Task")
+        is_batch = task_info.get("is_batch", False)
         
+        uid = f"resume_{int(time.time())}_{random.randint(1000, 9999)}"
+        self.active_tasks[uid] = {
+            "channel_name": f"[重派排程] {display_name}" if is_batch else f"[重派手動] {display_name}",
+            "platform": plat,
+            "url": url,
+            "status": "排程下載中" if is_batch else "下載中",
+            "progress": 0.0,
+            "speed": "",
+            "size": "",
+            "elapsed": "00:00",
+            "start_time": time.time(),
+            "process": None
+        }
+        self.refresh_tasks_ui()
+        self.add_log(f"🚀 [自動派回] 已確認 Token 認證有效，重新啟動下載任務: {display_name}", "SUCCESS")
         t = threading.Thread(target=workers.worker_manual_download, args=(self, uid, url, custom_path, plat, quality, fmt), daemon=True)
         t.start()
 
@@ -1518,385 +2034,497 @@ class App(ctk.CTk):
         
         # Header Area
         header_frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
-        header_frame.grid(row=0, column=0, padx=15, pady=(10, 15), sticky="ew")
+        header_frame.grid(row=0, column=0, padx=12, pady=(10, 15), sticky="ew")
         header_frame.grid_columnconfigure(0, weight=1)
         
-        ctk.CTkLabel(header_frame, text="⚙️ 系統及平台設定", font=ctk.CTkFont(size=18, weight="bold"), text_color=self.c_text_primary).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(header_frame, text="⚙️ 系統及平台設定", font=ctk.CTkFont(family="Segoe UI Variable Text", size=16, weight="bold"), text_color=self.c_text_primary).grid(row=0, column=0, sticky="w")
         
         self.save_settings_btn = ctk.CTkButton(
             header_frame, 
             text="💾 儲存所有設定", 
             fg_color=self.c_green, 
-            hover_color="#0fa472", 
-            font=ctk.CTkFont(weight="bold"),
+            hover_color="#059669", 
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=12, weight="bold"),
+            height=32,
+            corner_radius=6,
             command=self.apply_and_save_settings_gui
         )
         self.save_settings_btn.grid(row=0, column=1, sticky="e")
         
         # Settings Fields Scrollable Frame
         scroll_settings = ctk.CTkScrollableFrame(settings_frame, fg_color=self.c_frame, border_color=self.c_card_border, border_width=1, corner_radius=12)
-        scroll_settings.grid(row=1, column=0, padx=15, pady=5, sticky="nsew")
+        scroll_settings.grid(row=1, column=0, padx=12, pady=5, sticky="nsew")
         scroll_settings.grid_columnconfigure(1, weight=1)
         
-        form_label_font = ctk.CTkFont(size=13, weight="bold")
-        header_font = ctk.CTkFont(size=15, weight="bold")
+        form_label_font = ctk.CTkFont(family="Segoe UI Variable Text", size=12, weight="bold")
+        header_font = ctk.CTkFont(family="Segoe UI Variable Text", size=14, weight="bold")
         
         row_idx = 0
         
         # ================= 🖥️ 系統運作設定 =================
-        ctk.CTkLabel(scroll_settings, text="🖥️ 系統運作設定", font=header_font, text_color=self.c_text_primary).grid(row=row_idx, column=0, columnspan=2, padx=15, pady=(15, 10), sticky="w")
+        ctk.CTkLabel(scroll_settings, text="🖥️ 系統運作設定", font=header_font, text_color=self.c_text_primary).grid(row=row_idx, column=0, columnspan=2, padx=16, pady=(16, 10), sticky="w")
         row_idx += 1
         
         # 預設檔案儲存路徑
-        ctk.CTkLabel(scroll_settings, text="預設檔案儲存路徑:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=25, pady=8, sticky="w")
+        ctk.CTkLabel(scroll_settings, text="預設檔案儲存路徑:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=20, pady=6, sticky="w")
         dir_frame = ctk.CTkFrame(scroll_settings, fg_color="transparent")
-        dir_frame.grid(row=row_idx, column=1, padx=25, pady=8, sticky="ew")
+        dir_frame.grid(row=row_idx, column=1, padx=20, pady=6, sticky="ew")
         dir_frame.grid_columnconfigure(0, weight=1)
         
-        self.download_dir_entry = ctk.CTkEntry(dir_frame, fg_color=self.c_sidebar, border_color=self.c_card_border, text_color=self.c_text_primary)
+        self.download_dir_entry = ctk.CTkEntry(dir_frame, fg_color=self.c_sidebar, border_color=self.c_card_border, text_color=self.c_text_primary, height=34, corner_radius=6)
         self.download_dir_entry.grid(row=0, column=0, padx=(0, 10), pady=0, sticky="ew")
         self.download_dir_entry.bind("<KeyRelease>", self.on_settings_modified)
         
-        dir_browse_btn = ctk.CTkButton(dir_frame, text="瀏覽...", width=70, fg_color="gray30", hover_color="gray40", text_color=self.c_text_primary, command=self.browse_download_directory)
+        dir_browse_btn = ctk.CTkButton(dir_frame, text="瀏覽...", width=75, height=34, fg_color="#1e293b", hover_color="#334155", text_color=self.c_text_primary, corner_radius=6, font=ctk.CTkFont(family="Segoe UI Variable Text", size=12, weight="bold"), command=self.browse_download_directory)
         dir_browse_btn.grid(row=0, column=1, padx=0, pady=0)
         row_idx += 1
         
-        # Discord 通知 Webhook
-        ctk.CTkLabel(scroll_settings, text="Discord 通知 Webhook:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=25, pady=8, sticky="w")
-        self.discord_webhook_entry = ctk.CTkEntry(scroll_settings, fg_color=self.c_sidebar, border_color=self.c_card_border, text_color=self.c_text_primary)
-        self.discord_webhook_entry.grid(row=row_idx, column=1, padx=25, pady=8, sticky="ew")
-        self.discord_webhook_entry.bind("<KeyRelease>", self.on_settings_modified)
+        # Discord Bot Token
+        ctk.CTkLabel(scroll_settings, text="Discord Bot Token:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=20, pady=6, sticky="w")
+        self.discord_bot_token_entry = ctk.CTkEntry(scroll_settings, fg_color=self.c_sidebar, border_color=self.c_card_border, text_color=self.c_text_primary, height=34, corner_radius=6)
+        self.discord_bot_token_entry.grid(row=row_idx, column=1, padx=20, pady=6, sticky="ew")
+        self.discord_bot_token_entry.bind("<KeyRelease>", self.on_settings_modified)
+        row_idx += 1
+
+        # Discord 頻道 ID
+        ctk.CTkLabel(scroll_settings, text="Discord 直播狀態頻道 ID:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=20, pady=6, sticky="w")
+        self.discord_channel_id_entry = ctk.CTkEntry(scroll_settings, fg_color=self.c_sidebar, border_color=self.c_card_border, text_color=self.c_text_primary, height=34, corner_radius=6)
+        self.discord_channel_id_entry.grid(row=row_idx, column=1, padx=20, pady=6, sticky="ew")
+        self.discord_channel_id_entry.bind("<KeyRelease>", self.on_settings_modified)
+        row_idx += 1
+        
+        # Discord 下載完成頻道 ID
+        ctk.CTkLabel(scroll_settings, text="Discord 下載完成頻道 ID:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=20, pady=6, sticky="w")
+        self.discord_completed_channel_id_entry = ctk.CTkEntry(scroll_settings, fg_color=self.c_sidebar, border_color=self.c_card_border, text_color=self.c_text_primary, height=34, corner_radius=6)
+        self.discord_completed_channel_id_entry.grid(row=row_idx, column=1, padx=20, pady=6, sticky="ew")
+        self.discord_completed_channel_id_entry.bind("<KeyRelease>", self.on_settings_modified)
         row_idx += 1
         
         # 手動排程下載上限
-        ctk.CTkLabel(scroll_settings, text="手動排程下載上限:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=25, pady=8, sticky="w")
-        self.max_dl_spinner = ctk.CTkEntry(scroll_settings, width=80, fg_color=self.c_sidebar, border_color=self.c_card_border, text_color=self.c_text_primary)
-        self.max_dl_spinner.grid(row=row_idx, column=1, padx=25, pady=8, sticky="w")
+        ctk.CTkLabel(scroll_settings, text="手動排程下載上限:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=20, pady=6, sticky="w")
+        self.max_dl_spinner = ctk.CTkEntry(scroll_settings, width=80, height=34, corner_radius=6, fg_color=self.c_sidebar, border_color=self.c_card_border, text_color=self.c_text_primary)
+        self.max_dl_spinner.grid(row=row_idx, column=1, padx=20, pady=6, sticky="w")
         self.max_dl_spinner.bind("<KeyRelease>", self.on_settings_modified)
         row_idx += 1
         
+        # yt-dlp 多通路分段併發下載數 (-N)
+        ctk.CTkLabel(scroll_settings, text="yt-dlp 多通路分段加速 (-N):", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=20, pady=6, sticky="w")
+        self.concurrent_frags_menu = ctk.CTkOptionMenu(
+            scroll_settings,
+            values=["8 通路 (推薦高速)", "16 通路 (極速)", "32 通路 (超速)", "4 通路 (標準)", "1 通路 (單線程)"],
+            height=32,
+            corner_radius=6,
+            fg_color=self.c_sidebar,
+            button_color=self.c_accent,
+            button_hover_color=self.c_accent_hover,
+            dropdown_fg_color=self.c_sidebar,
+            dropdown_text_color=self.c_text_primary,
+            dropdown_hover_color="#1e293b",
+            text_color=self.c_text_primary,
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=12),
+            command=self.on_settings_modified
+        )
+        self.concurrent_frags_menu.grid(row=row_idx, column=1, padx=20, pady=6, sticky="w")
+        row_idx += 1
+        
         # 自訂連線 User-Agent
-        ctk.CTkLabel(scroll_settings, text="自訂連線 User-Agent:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=25, pady=8, sticky="w")
-        self.ua_entry = ctk.CTkEntry(scroll_settings, fg_color=self.c_sidebar, border_color=self.c_card_border, text_color=self.c_text_primary)
-        self.ua_entry.grid(row=row_idx, column=1, padx=25, pady=8, sticky="ew")
+        ctk.CTkLabel(scroll_settings, text="自訂連線 User-Agent:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=20, pady=6, sticky="w")
+        self.ua_entry = ctk.CTkEntry(scroll_settings, fg_color=self.c_sidebar, border_color=self.c_card_border, text_color=self.c_text_primary, height=34, corner_radius=6)
+        self.ua_entry.grid(row=row_idx, column=1, padx=20, pady=6, sticky="ew")
         self.ua_entry.bind("<KeyRelease>", self.on_settings_modified)
         row_idx += 1
         
         # 下載防睡眠設定
-        ctk.CTkLabel(scroll_settings, text="下載防睡眠設定:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=25, pady=8, sticky="w")
+        ctk.CTkLabel(scroll_settings, text="下載防睡眠設定:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=20, pady=6, sticky="w")
         self.prevent_sleep_menu = ctk.CTkOptionMenu(
             scroll_settings,
             values=["下載/監控時阻擋睡眠", "完全阻擋睡眠", "恢復系統預設"],
+            height=32,
+            corner_radius=6,
             fg_color=self.c_sidebar,
             button_color=self.c_accent,
             button_hover_color=self.c_accent_hover,
             dropdown_fg_color=self.c_sidebar,
             dropdown_text_color=self.c_text_primary,
-            dropdown_hover_color=self.c_card_border,
+            dropdown_hover_color="#1e293b",
             text_color=self.c_text_primary,
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=12),
             command=self.on_settings_modified
         )
-        self.prevent_sleep_menu.grid(row=row_idx, column=1, padx=25, pady=8, sticky="w")
+        self.prevent_sleep_menu.grid(row=row_idx, column=1, padx=20, pady=6, sticky="w")
         row_idx += 1
         
         # Divider
-        ctk.CTkFrame(scroll_settings, height=2, fg_color=self.c_card_border).grid(row=row_idx, column=0, columnspan=2, padx=15, pady=15, sticky="ew")
+        ctk.CTkFrame(scroll_settings, height=1, fg_color=self.c_card_border).grid(row=row_idx, column=0, columnspan=2, padx=16, pady=12, sticky="ew")
         row_idx += 1
         
         # ================= 🎥 YouTube 下載設定 =================
-        ctk.CTkLabel(scroll_settings, text="🎥 YouTube 下載設定", font=header_font, text_color=self.c_red).grid(row=row_idx, column=0, columnspan=2, padx=15, pady=(15, 10), sticky="w")
+        ctk.CTkLabel(scroll_settings, text="🎥 YouTube 下載設定", font=header_font, text_color=self.c_red_text).grid(row=row_idx, column=0, columnspan=2, padx=16, pady=(12, 8), sticky="w")
         row_idx += 1
         
         # Cookies 檔案位置
-        ctk.CTkLabel(scroll_settings, text="YouTube Cookies 檔案位置:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=25, pady=8, sticky="w")
+        ctk.CTkLabel(scroll_settings, text="YouTube Cookies 檔案位置:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=20, pady=6, sticky="w")
         cookies_frame = ctk.CTkFrame(scroll_settings, fg_color="transparent")
-        cookies_frame.grid(row=row_idx, column=1, padx=25, pady=8, sticky="ew")
+        cookies_frame.grid(row=row_idx, column=1, padx=20, pady=6, sticky="ew")
         cookies_frame.grid_columnconfigure(0, weight=1)
         
-        self.cookies_file_entry = ctk.CTkEntry(cookies_frame, fg_color=self.c_sidebar, border_color=self.c_card_border, text_color=self.c_text_primary)
+        self.cookies_file_entry = ctk.CTkEntry(cookies_frame, fg_color=self.c_sidebar, border_color=self.c_card_border, text_color=self.c_text_primary, height=34, corner_radius=6)
         self.cookies_file_entry.grid(row=0, column=0, padx=(0, 10), pady=0, sticky="ew")
         self.cookies_file_entry.bind("<KeyRelease>", self.on_settings_modified)
         
-        cookies_browse_btn = ctk.CTkButton(cookies_frame, text="瀏覽...", width=70, fg_color="gray30", hover_color="gray40", text_color=self.c_text_primary, command=self.browse_cookies_file)
+        cookies_browse_btn = ctk.CTkButton(cookies_frame, text="瀏覽...", width=75, height=34, fg_color="#1e293b", hover_color="#334155", text_color=self.c_text_primary, corner_radius=6, font=ctk.CTkFont(family="Segoe UI Variable Text", size=12, weight="bold"), command=self.browse_cookies_file)
         cookies_browse_btn.grid(row=0, column=1, padx=0, pady=0)
         row_idx += 1
         
         # YT 畫質優先度 (yt-dlp)
-        ctk.CTkLabel(scroll_settings, text="YT 畫質優先度 (yt-dlp):", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=25, pady=8, sticky="w")
+        ctk.CTkLabel(scroll_settings, text="YT 畫質優先度 (yt-dlp):", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=20, pady=6, sticky="w")
         self.yt_quality_menu = ctk.CTkOptionMenu(
             scroll_settings,
             values=["best", "1080p", "720p", "480p", "360p", "worst"],
+            height=32,
+            corner_radius=6,
             fg_color=self.c_sidebar,
             button_color=self.c_accent,
             button_hover_color=self.c_accent_hover,
             dropdown_fg_color=self.c_sidebar,
             dropdown_text_color=self.c_text_primary,
-            dropdown_hover_color=self.c_accent_hover,
+            dropdown_hover_color="#1e293b",
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=12),
             command=self.on_settings_modified
         )
-        self.yt_quality_menu.grid(row=row_idx, column=1, padx=25, pady=8, sticky="w")
+        self.yt_quality_menu.grid(row=row_idx, column=1, padx=20, pady=6, sticky="w")
         row_idx += 1
         
         # YT 檔案格式 (yt-dlp)
-        ctk.CTkLabel(scroll_settings, text="YT 檔案格式 (yt-dlp):", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=25, pady=8, sticky="w")
+        ctk.CTkLabel(scroll_settings, text="YT 檔案格式 (yt-dlp):", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=20, pady=6, sticky="w")
         self.yt_format_menu = ctk.CTkOptionMenu(
             scroll_settings,
             values=["mp4", "mkv", "webm"],
+            height=32,
+            corner_radius=6,
             fg_color=self.c_sidebar,
             button_color=self.c_accent,
             button_hover_color=self.c_accent_hover,
             dropdown_fg_color=self.c_sidebar,
             dropdown_text_color=self.c_text_primary,
-            dropdown_hover_color=self.c_accent_hover,
+            dropdown_hover_color="#1e293b",
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=12),
             command=self.on_settings_modified
         )
-        self.yt_format_menu.grid(row=row_idx, column=1, padx=25, pady=8, sticky="w")
+        self.yt_format_menu.grid(row=row_idx, column=1, padx=20, pady=6, sticky="w")
         row_idx += 1
         
         # 指定關鍵字
-        ctk.CTkLabel(scroll_settings, text="指定關鍵字:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=25, pady=8, sticky="w")
+        ctk.CTkLabel(scroll_settings, text="指定關鍵字:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=20, pady=6, sticky="w")
         self.yt_keywords_entry = ctk.CTkEntry(
             scroll_settings, 
             placeholder_text="例如: 歌枠,歌回 (標題包含任一詞才下載，空白則全下載)",
             fg_color=self.c_sidebar,
             border_color=self.c_card_border,
+            height=34,
+            corner_radius=6,
             text_color=self.c_text_primary,
-            placeholder_text_color="#4f6668"
+            placeholder_text_color=self.c_text_muted
         )
-        self.yt_keywords_entry.grid(row=row_idx, column=1, padx=25, pady=8, sticky="ew")
+        self.yt_keywords_entry.grid(row=row_idx, column=1, padx=20, pady=6, sticky="ew")
         self.yt_keywords_entry.bind("<KeyRelease>", self.on_settings_modified)
         row_idx += 1
         
         # Divider
-        ctk.CTkFrame(scroll_settings, height=2, fg_color=self.c_card_border).grid(row=row_idx, column=0, columnspan=2, padx=15, pady=15, sticky="ew")
+        ctk.CTkFrame(scroll_settings, height=1, fg_color=self.c_card_border).grid(row=row_idx, column=0, columnspan=2, padx=16, pady=12, sticky="ew")
         row_idx += 1
         
         # ================= 🎵 Rplay 平台設定 =================
-        ctk.CTkLabel(scroll_settings, text="🎵 Rplay 平台設定", font=header_font, text_color=self.c_blue).grid(row=row_idx, column=0, columnspan=2, padx=15, pady=(15, 10), sticky="w")
+        ctk.CTkLabel(scroll_settings, text="🎵 Rplay 平台設定", font=header_font, text_color=self.c_blue_text).grid(row=row_idx, column=0, columnspan=2, padx=16, pady=(12, 8), sticky="w")
         row_idx += 1
         
         # Rplay Token
-        ctk.CTkLabel(scroll_settings, text="Rplay Token:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=25, pady=8, sticky="w")
+        ctk.CTkLabel(scroll_settings, text="Rplay Token:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=20, pady=6, sticky="w")
         rplay_pwd_frame = ctk.CTkFrame(scroll_settings, fg_color="transparent")
-        rplay_pwd_frame.grid(row=row_idx, column=1, padx=25, pady=8, sticky="ew")
+        rplay_pwd_frame.grid(row=row_idx, column=1, padx=20, pady=6, sticky="ew")
         rplay_pwd_frame.grid_columnconfigure(0, weight=1)
         
-        self.rplay_token_entry = ctk.CTkEntry(rplay_pwd_frame, show="*", fg_color=self.c_sidebar, border_color=self.c_card_border, text_color=self.c_text_primary)
+        self.rplay_token_entry = ctk.CTkEntry(rplay_pwd_frame, show="*", fg_color=self.c_sidebar, border_color=self.c_card_border, text_color=self.c_text_primary, height=34, corner_radius=6)
         self.rplay_token_entry.grid(row=0, column=0, padx=(0, 10), pady=0, sticky="ew")
         self.rplay_token_entry.bind("<KeyRelease>", self.on_settings_modified)
         
         self.btn_toggle_rplay_token = ctk.CTkButton(
-            rplay_pwd_frame, text="👁️", width=36, fg_color="gray30", hover_color="gray40", text_color=self.c_text_primary,
+            rplay_pwd_frame, text="👁️", width=36, height=34, fg_color="#1e293b", hover_color="#334155", text_color=self.c_text_primary, corner_radius=6,
             command=lambda: self.toggle_password_visibility(self.rplay_token_entry, self.btn_toggle_rplay_token)
         )
         self.btn_toggle_rplay_token.grid(row=0, column=1, padx=0, pady=0)
         row_idx += 1
 
-        # Rplay Username
-        ctk.CTkLabel(scroll_settings, text="Rplay 帳號 (Email):", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=25, pady=8, sticky="w")
-        self.rplay_username_entry = ctk.CTkEntry(scroll_settings, fg_color=self.c_sidebar, border_color=self.c_card_border, text_color=self.c_text_primary)
-        self.rplay_username_entry.grid(row=row_idx, column=1, padx=25, pady=8, sticky="ew")
+        # Rplay User OID (24碼)
+        ctk.CTkLabel(scroll_settings, text="Rplay User OID (24碼):", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=20, pady=6, sticky="w")
+        self.rplay_username_entry = ctk.CTkEntry(scroll_settings, fg_color=self.c_sidebar, border_color=self.c_card_border, text_color=self.c_text_primary, height=34, corner_radius=6, placeholder_text="例如: 660d6cee4eb65b83664f365b", placeholder_text_color=self.c_text_muted)
+        self.rplay_username_entry.grid(row=row_idx, column=1, padx=20, pady=6, sticky="ew")
         self.rplay_username_entry.bind("<KeyRelease>", self.on_settings_modified)
         row_idx += 1
-
-        # Rplay Password
-        ctk.CTkLabel(scroll_settings, text="Rplay 密碼:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=25, pady=8, sticky="w")
-        rplay_pwd_frame2 = ctk.CTkFrame(scroll_settings, fg_color="transparent")
-        rplay_pwd_frame2.grid(row=row_idx, column=1, padx=25, pady=8, sticky="ew")
-        rplay_pwd_frame2.grid_columnconfigure(0, weight=1)
         
-        self.rplay_password_entry = ctk.CTkEntry(rplay_pwd_frame2, show="*", fg_color=self.c_sidebar, border_color=self.c_card_border, text_color=self.c_text_primary)
-        self.rplay_password_entry.grid(row=0, column=0, padx=(0, 10), pady=0, sticky="ew")
-        self.rplay_password_entry.bind("<KeyRelease>", self.on_settings_modified)
+        # 油猴 / 跨裝置 Token 同步位址一鍵複製
+        ctk.CTkLabel(scroll_settings, text="Token 同步位址複製:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=20, pady=6, sticky="w")
+        sync_urls_frame = ctk.CTkFrame(scroll_settings, fg_color="transparent")
+        sync_urls_frame.grid(row=row_idx, column=1, padx=20, pady=6, sticky="ew")
         
-        self.btn_toggle_rplay_password = ctk.CTkButton(
-            rplay_pwd_frame2, text="👁️", width=36, fg_color="gray30", hover_color="gray40", text_color=self.c_text_primary,
-            command=lambda: self.toggle_password_visibility(self.rplay_password_entry, self.btn_toggle_rplay_password)
+        btn_copy_local_sync = ctk.CTkButton(
+            sync_urls_frame, 
+            text="💻 複製本機同步位址 (127.0.0.1)", 
+            fg_color="#1e293b", 
+            hover_color="#334155", 
+            height=32,
+            corner_radius=6,
+            text_color=self.c_text_primary,
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=11, weight="bold"),
+            command=self.copy_local_sync_url
         )
-        self.btn_toggle_rplay_password.grid(row=0, column=1, padx=0, pady=0)
+        btn_copy_local_sync.pack(side="left", padx=(0, 10))
+        
+        btn_copy_wifi_sync = ctk.CTkButton(
+            sync_urls_frame, 
+            text="📱 複製 Wi-Fi 跨裝置同步位址 (動態 IP)", 
+            fg_color=self.c_accent, 
+            hover_color=self.c_accent_hover, 
+            height=32,
+            corner_radius=6,
+            text_color=self.c_text_primary,
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=11, weight="bold"),
+            command=self.copy_wifi_sync_url
+        )
+        btn_copy_wifi_sync.pack(side="left")
         row_idx += 1
         
         # Rplay 畫質優先度
-        ctk.CTkLabel(scroll_settings, text="Rplay 畫質優先度:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=25, pady=8, sticky="w")
+        ctk.CTkLabel(scroll_settings, text="Rplay 畫質優先度:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=20, pady=6, sticky="w")
         self.rplay_quality_menu = ctk.CTkOptionMenu(
             scroll_settings,
             values=["best", "1080p", "720p", "480p", "360p", "worst"],
+            height=32,
+            corner_radius=6,
             fg_color=self.c_sidebar,
             button_color=self.c_accent,
             button_hover_color=self.c_accent_hover,
             dropdown_fg_color=self.c_sidebar,
             dropdown_text_color=self.c_text_primary,
-            dropdown_hover_color=self.c_accent_hover,
+            dropdown_hover_color="#1e293b",
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=12),
             command=self.on_settings_modified
         )
-        self.rplay_quality_menu.grid(row=row_idx, column=1, padx=25, pady=8, sticky="w")
+        self.rplay_quality_menu.grid(row=row_idx, column=1, padx=20, pady=6, sticky="w")
         row_idx += 1
 
         # Rplay 檔案格式
-        ctk.CTkLabel(scroll_settings, text="Rplay 檔案格式:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=25, pady=8, sticky="w")
+        ctk.CTkLabel(scroll_settings, text="Rplay 檔案格式:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=20, pady=6, sticky="w")
         self.rplay_format_menu = ctk.CTkOptionMenu(
             scroll_settings,
             values=["mp4", "mkv", "ts"],
+            height=32,
+            corner_radius=6,
             fg_color=self.c_sidebar,
             button_color=self.c_accent,
             button_hover_color=self.c_accent_hover,
             dropdown_fg_color=self.c_sidebar,
             dropdown_text_color=self.c_text_primary,
-            dropdown_hover_color=self.c_accent_hover,
+            dropdown_hover_color="#1e293b",
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=12),
             command=self.on_settings_modified
         )
-        self.rplay_format_menu.grid(row=row_idx, column=1, padx=25, pady=8, sticky="w")
+        self.rplay_format_menu.grid(row=row_idx, column=1, padx=20, pady=6, sticky="w")
         row_idx += 1
         
         # Divider
-        ctk.CTkFrame(scroll_settings, height=2, fg_color=self.c_card_border).grid(row=row_idx, column=0, columnspan=2, padx=15, pady=15, sticky="ew")
+        ctk.CTkFrame(scroll_settings, height=1, fg_color=self.c_card_border).grid(row=row_idx, column=0, columnspan=2, padx=16, pady=12, sticky="ew")
         row_idx += 1
         
         # ================= 🪐 Withny 平台設定 =================
-        ctk.CTkLabel(scroll_settings, text="🪐 Withny 平台設定", font=header_font, text_color=self.c_purple).grid(row=row_idx, column=0, columnspan=2, padx=15, pady=(15, 10), sticky="w")
+        ctk.CTkLabel(scroll_settings, text="🪐 Withny 平台設定", font=header_font, text_color=self.c_purple_text).grid(row=row_idx, column=0, columnspan=2, padx=16, pady=(12, 8), sticky="w")
         row_idx += 1
         
         # Withny Token
-        ctk.CTkLabel(scroll_settings, text="Withny Token (Session):", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=25, pady=8, sticky="w")
+        ctk.CTkLabel(scroll_settings, text="Withny Token (Session):", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=20, pady=6, sticky="w")
         withny_pwd_frame = ctk.CTkFrame(scroll_settings, fg_color="transparent")
-        withny_pwd_frame.grid(row=row_idx, column=1, padx=25, pady=8, sticky="ew")
+        withny_pwd_frame.grid(row=row_idx, column=1, padx=20, pady=6, sticky="ew")
         withny_pwd_frame.grid_columnconfigure(0, weight=1)
         
-        self.withny_token_entry = ctk.CTkEntry(withny_pwd_frame, show="*", fg_color=self.c_sidebar, border_color=self.c_card_border, text_color=self.c_text_primary)
+        self.withny_token_entry = ctk.CTkEntry(withny_pwd_frame, show="*", fg_color=self.c_sidebar, border_color=self.c_card_border, text_color=self.c_text_primary, height=34, corner_radius=6)
         self.withny_token_entry.grid(row=0, column=0, padx=(0, 10), pady=0, sticky="ew")
         self.withny_token_entry.bind("<KeyRelease>", self.on_settings_modified)
         
         self.btn_toggle_withny_token = ctk.CTkButton(
-            withny_pwd_frame, text="👁️", width=36, fg_color="gray30", hover_color="gray40", text_color=self.c_text_primary,
+            withny_pwd_frame, text="👁️", width=36, height=34, fg_color="#1e293b", hover_color="#334155", text_color=self.c_text_primary, corner_radius=6,
             command=lambda: self.toggle_password_visibility(self.withny_token_entry, self.btn_toggle_withny_token)
         )
         self.btn_toggle_withny_token.grid(row=0, column=1, padx=0, pady=0)
         row_idx += 1
         
+        # Withny Token 同步位址複製
+        ctk.CTkLabel(scroll_settings, text="Token 同步位址複製:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=20, pady=6, sticky="w")
+        withny_sync_urls_frame = ctk.CTkFrame(scroll_settings, fg_color="transparent")
+        withny_sync_urls_frame.grid(row=row_idx, column=1, padx=20, pady=6, sticky="ew")
+        
+        btn_copy_withny_local = ctk.CTkButton(
+            withny_sync_urls_frame, 
+            text="💻 複製本機同步位址 (127.0.0.1)", 
+            fg_color="#1e293b", 
+            hover_color="#334155", 
+            height=32,
+            corner_radius=6,
+            text_color=self.c_text_primary,
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=11, weight="bold"),
+            command=self.copy_withny_local_sync_url
+        )
+        btn_copy_withny_local.pack(side="left", padx=(0, 10))
+        
+        btn_copy_withny_wifi = ctk.CTkButton(
+            withny_sync_urls_frame, 
+            text="📱 複製 Wi-Fi 跨裝置同步位址 (動態 IP)", 
+            fg_color=self.c_purple, 
+            hover_color=self.c_accent_hover, 
+            height=32,
+            corner_radius=6,
+            text_color="#ffffff",
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=11, weight="bold"),
+            command=self.copy_withny_wifi_sync_url
+        )
+        btn_copy_withny_wifi.pack(side="left")
+        row_idx += 1
+        
         # Withny 畫質優先度 (僅限原始畫質)
-        ctk.CTkLabel(scroll_settings, text="Withny 畫質優先度:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=25, pady=8, sticky="w")
+        ctk.CTkLabel(scroll_settings, text="Withny 畫質優先度:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=20, pady=6, sticky="w")
         self.withny_quality_menu = ctk.CTkOptionMenu(
             scroll_settings,
             values=["自動(原始)"],
+            height=32,
+            corner_radius=6,
             fg_color=self.c_sidebar,
-            button_color="gray30",
-            button_hover_color="gray30",
+            button_color="#334155",
+            button_hover_color="#334155",
             dropdown_fg_color=self.c_sidebar,
             dropdown_text_color=self.c_text_primary,
-            dropdown_hover_color=self.c_accent_hover,
+            dropdown_hover_color="#1e293b",
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=12),
             state="disabled"
         )
-        self.withny_quality_menu.grid(row=row_idx, column=1, padx=25, pady=8, sticky="w")
+        self.withny_quality_menu.grid(row=row_idx, column=1, padx=20, pady=6, sticky="w")
         row_idx += 1
         
         # Withny 影音格式轉換 (Remux)
-        ctk.CTkLabel(scroll_settings, text="Withny 影音格式轉換 (Remux):", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=25, pady=8, sticky="w")
+        ctk.CTkLabel(scroll_settings, text="Withny 影音格式轉換 (Remux):", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=20, pady=6, sticky="w")
         self.withny_remux_var = ctk.BooleanVar()
         self.withny_remux_switch = ctk.CTkSwitch(
             scroll_settings, text="啟用即時重封裝 (不推薦，建議使用 Concat 代替)", variable=self.withny_remux_var,
-            text_color=self.c_text_primary, progress_color=self.c_accent, button_color=self.c_text_primary, button_hover_color=self.c_accent_hover,
+            text_color=self.c_text_primary, font=ctk.CTkFont(family="Segoe UI Variable Text", size=12), progress_color=self.c_accent, button_color=self.c_text_primary, button_hover_color=self.c_accent_hover,
             command=self.on_settings_modified
         )
-        self.withny_remux_switch.grid(row=row_idx, column=1, padx=25, pady=8, sticky="w")
+        self.withny_remux_switch.grid(row=row_idx, column=1, padx=20, pady=6, sticky="w")
         row_idx += 1
         
         # Withny Remux 目標副檔名
-        ctk.CTkLabel(scroll_settings, text="Withny Remux 目標副檔名:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=25, pady=8, sticky="w")
+        ctk.CTkLabel(scroll_settings, text="Withny Remux 目標副檔名:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=20, pady=6, sticky="w")
         self.withny_remux_format_menu = ctk.CTkOptionMenu(
             scroll_settings,
             values=["mp4", "mkv", "mov", "ts"],
+            height=32,
+            corner_radius=6,
             fg_color=self.c_sidebar,
             button_color=self.c_accent,
             button_hover_color=self.c_accent_hover,
             dropdown_fg_color=self.c_sidebar,
             dropdown_text_color=self.c_text_primary,
-            dropdown_hover_color=self.c_accent_hover,
+            dropdown_hover_color="#1e293b",
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=12),
             command=self.on_settings_modified
         )
-        self.withny_remux_format_menu.grid(row=row_idx, column=1, padx=25, pady=8, sticky="w")
+        self.withny_remux_format_menu.grid(row=row_idx, column=1, padx=20, pady=6, sticky="w")
         row_idx += 1
         
         # Withny 合併連續分段 (Concat)
-        ctk.CTkLabel(scroll_settings, text="Withny 合併連續分段 (Concat):", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=25, pady=8, sticky="w")
+        ctk.CTkLabel(scroll_settings, text="Withny 合併連續分段 (Concat):", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=20, pady=6, sticky="w")
         self.withny_concat_var = ctk.BooleanVar()
         self.withny_concat_switch = ctk.CTkSwitch(
             scroll_settings, text="自動合併並重封裝為目標格式 (推薦，能防止損壞)", variable=self.withny_concat_var,
-            text_color=self.c_text_primary, progress_color=self.c_accent, button_color=self.c_text_primary, button_hover_color=self.c_accent_hover,
+            text_color=self.c_text_primary, font=ctk.CTkFont(family="Segoe UI Variable Text", size=12), progress_color=self.c_accent, button_color=self.c_text_primary, button_hover_color=self.c_accent_hover,
             command=self.on_settings_modified
         )
-        self.withny_concat_switch.grid(row=row_idx, column=1, padx=25, pady=8, sticky="w")
+        self.withny_concat_switch.grid(row=row_idx, column=1, padx=20, pady=6, sticky="w")
         row_idx += 1
         
         # Withny 保留 TS 暫存分段
-        ctk.CTkLabel(scroll_settings, text="Withny 保留 TS 暫存分段:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=25, pady=8, sticky="w")
+        ctk.CTkLabel(scroll_settings, text="Withny 保留 TS 暫存分段:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=20, pady=6, sticky="w")
         self.withny_keep_var = ctk.BooleanVar()
         self.withny_keep_switch = ctk.CTkSwitch(
             scroll_settings, text="合併後保留原本的分段小 TS 檔案", variable=self.withny_keep_var,
-            text_color=self.c_text_primary, progress_color=self.c_accent, button_color=self.c_text_primary, button_hover_color=self.c_accent_hover,
+            text_color=self.c_text_primary, font=ctk.CTkFont(family="Segoe UI Variable Text", size=12), progress_color=self.c_accent, button_color=self.c_text_primary, button_hover_color=self.c_accent_hover,
             command=self.on_settings_modified
         )
-        self.withny_keep_switch.grid(row=row_idx, column=1, padx=25, pady=8, sticky="w")
+        self.withny_keep_switch.grid(row=row_idx, column=1, padx=20, pady=6, sticky="w")
         row_idx += 1
         
         # Withny 斷線重試檢查間隔
-        ctk.CTkLabel(scroll_settings, text="Withny 斷線重試檢查間隔:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=25, pady=8, sticky="w")
-        self.withny_wait_entry = ctk.CTkEntry(scroll_settings, fg_color=self.c_sidebar, border_color=self.c_card_border, text_color=self.c_text_primary)
-        self.withny_wait_entry.grid(row=row_idx, column=1, padx=25, pady=8, sticky="w")
+        ctk.CTkLabel(scroll_settings, text="Withny 斷線重試檢查間隔:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=20, pady=6, sticky="w")
+        self.withny_wait_entry = ctk.CTkEntry(scroll_settings, fg_color=self.c_sidebar, border_color=self.c_card_border, text_color=self.c_text_primary, height=34, corner_radius=6)
+        self.withny_wait_entry.grid(row=row_idx, column=1, padx=20, pady=6, sticky="w")
         self.withny_wait_entry.bind("<KeyRelease>", self.on_settings_modified)
         row_idx += 1
         
         # Divider
-        ctk.CTkFrame(scroll_settings, height=2, fg_color=self.c_card_border).grid(row=row_idx, column=0, columnspan=2, padx=15, pady=15, sticky="ew")
+        ctk.CTkFrame(scroll_settings, height=1, fg_color=self.c_card_border).grid(row=row_idx, column=0, columnspan=2, padx=16, pady=12, sticky="ew")
         row_idx += 1
         
         # ================= 📺 FC2 平台設定 =================
-        ctk.CTkLabel(scroll_settings, text="📺 FC2 平台設定", font=header_font, text_color=self.c_yellow).grid(row=row_idx, column=0, columnspan=2, padx=15, pady=(15, 10), sticky="w")
+        ctk.CTkLabel(scroll_settings, text="📺 FC2 平台設定", font=header_font, text_color=self.c_yellow_text).grid(row=row_idx, column=0, columnspan=2, padx=16, pady=(12, 8), sticky="w")
         row_idx += 1
         
         # FC2 Cookies 檔案位置
-        ctk.CTkLabel(scroll_settings, text="FC2 Cookies 檔案位置:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=25, pady=8, sticky="w")
+        ctk.CTkLabel(scroll_settings, text="FC2 Cookies 檔案位置:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=20, pady=6, sticky="w")
         fc2_cookies_frame = ctk.CTkFrame(scroll_settings, fg_color="transparent")
-        fc2_cookies_frame.grid(row=row_idx, column=1, padx=25, pady=8, sticky="ew")
+        fc2_cookies_frame.grid(row=row_idx, column=1, padx=20, pady=6, sticky="ew")
         fc2_cookies_frame.grid_columnconfigure(0, weight=1)
         
-        self.fc2_cookies_file_entry = ctk.CTkEntry(fc2_cookies_frame, fg_color=self.c_sidebar, border_color=self.c_card_border, text_color=self.c_text_primary)
+        self.fc2_cookies_file_entry = ctk.CTkEntry(fc2_cookies_frame, fg_color=self.c_sidebar, border_color=self.c_card_border, text_color=self.c_text_primary, height=34, corner_radius=6)
         self.fc2_cookies_file_entry.grid(row=0, column=0, padx=(0, 10), pady=0, sticky="ew")
         self.fc2_cookies_file_entry.bind("<KeyRelease>", self.on_settings_modified)
         
-        fc2_cookies_browse_btn = ctk.CTkButton(fc2_cookies_frame, text="瀏覽...", width=70, fg_color="gray30", hover_color="gray40", text_color=self.c_text_primary, command=self.browse_fc2_cookies_file)
+        fc2_cookies_browse_btn = ctk.CTkButton(fc2_cookies_frame, text="瀏覽...", width=75, height=34, fg_color="#1e293b", hover_color="#334155", text_color=self.c_text_primary, corner_radius=6, font=ctk.CTkFont(family="Segoe UI Variable Text", size=12, weight="bold"), command=self.browse_fc2_cookies_file)
         fc2_cookies_browse_btn.grid(row=0, column=1, padx=0, pady=0)
         row_idx += 1
         
         # FC2 畫質優先度
-        ctk.CTkLabel(scroll_settings, text="FC2 畫質優先度:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=25, pady=8, sticky="w")
+        ctk.CTkLabel(scroll_settings, text="FC2 畫質優先度:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=20, pady=6, sticky="w")
         self.fc2_quality_menu = ctk.CTkOptionMenu(
             scroll_settings,
             values=["3Mbps", "2Mbps", "1.2Mbps", "400Kbps", "150Kbps", "sound"],
+            height=32,
+            corner_radius=6,
             fg_color=self.c_sidebar,
             button_color=self.c_accent,
             button_hover_color=self.c_accent_hover,
             dropdown_fg_color=self.c_sidebar,
             dropdown_text_color=self.c_text_primary,
-            dropdown_hover_color=self.c_accent_hover,
+            dropdown_hover_color="#1e293b",
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=12),
             command=self.on_settings_modified
         )
-        self.fc2_quality_menu.grid(row=row_idx, column=1, padx=25, pady=8, sticky="w")
+        self.fc2_quality_menu.grid(row=row_idx, column=1, padx=20, pady=6, sticky="w")
         row_idx += 1
 
         # FC2 檔案格式
-        ctk.CTkLabel(scroll_settings, text="FC2 檔案格式:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=25, pady=8, sticky="w")
+        ctk.CTkLabel(scroll_settings, text="FC2 檔案格式:", text_color=self.c_text_secondary, font=form_label_font).grid(row=row_idx, column=0, padx=20, pady=6, sticky="w")
         self.fc2_format_menu = ctk.CTkOptionMenu(
             scroll_settings,
             values=["mp4", "mkv", "ts"],
+            height=32,
+            corner_radius=6,
             fg_color=self.c_sidebar,
             button_color=self.c_accent,
             button_hover_color=self.c_accent_hover,
             dropdown_fg_color=self.c_sidebar,
             dropdown_text_color=self.c_text_primary,
-            dropdown_hover_color=self.c_accent_hover,
+            dropdown_hover_color="#1e293b",
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=12),
             command=self.on_settings_modified
         )
-        self.fc2_format_menu.grid(row=row_idx, column=1, padx=25, pady=8, sticky="w")
+        self.fc2_format_menu.grid(row=row_idx, column=1, padx=20, pady=6, sticky="w")
         row_idx += 1
         
         # Load form fields
@@ -1939,86 +2567,122 @@ class App(ctk.CTk):
             self.manual_name_entry.insert(0, d.replace("\\", "/"))
 
     def load_manual_urls_from_txt(self):
-        filepath = ctk.filedialog.askopenfilename(filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+        filepath = ctk.filedialog.askopenfilename(
+            parent=self,
+            title="選取包含網址的 TXT 檔案",
+            filetypes=[("Text files", "*.txt"), ("List files", "*.list"), ("All files", "*.*")]
+        )
         if not filepath:
             return
             
+        clean_path = filepath.replace("\\", "/")
+        self.manual_url_entry.delete(0, "end")
+        self.manual_url_entry.insert(0, clean_path)
+        self.add_log(f"已選取 TXT 網址清單檔案: {clean_path}", "INFO")
+
+    def get_current_lan_ip(self):
+        import socket
         try:
-            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                lines = f.readlines()
-        except Exception as e:
-            self.add_log(f"讀取 TXT 檔案失敗: {e}", "ERROR")
-            messagebox.showerror("錯誤", f"讀取 TXT 檔案失敗: {e}")
-            return
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "127.0.0.1"
+
+    def copy_local_sync_url(self):
+        url = "http://127.0.0.1:18730/update_token"
+        self.clipboard_clear()
+        self.clipboard_append(url)
+        self.add_log(f"📋 已複製本機 Token 同步位址: {url}", "SUCCESS")
+        messagebox.showinfo("📋 已複製位址", f"【本機專用】同步位址已複製到剪貼簿：\n\n{url}\n\n適用於電腦本機瀏覽器 (Chrome / Edge / Firefox) 油猴腳本。")
+
+    def copy_wifi_sync_url(self):
+        current_ip = self.get_current_lan_ip()
+        url = f"http://{current_ip}:18730/update_token"
+        self.clipboard_clear()
+        self.clipboard_append(url)
+        self.add_log(f"📱 已複製 Rplay 動態局域網 Token 同步位址: {url}", "SUCCESS")
+        messagebox.showinfo("📋 已複製位址", f"【Rplay 跨裝置 Wi-Fi 專用】動態同步位址已複製到剪貼簿：\n\n{url}\n\n目前動態偵測本機 IP: {current_ip}\n適用於手機 Safari (Userscripts/Stay) 或其他連至同 Wi-Fi 之裝置。")
+
+    def copy_withny_local_sync_url(self):
+        url = "http://127.0.0.1:18730/update_withny_token"
+        self.clipboard_clear()
+        self.clipboard_append(url)
+        self.add_log(f"📋 已複製 Withny 本機 Token 同步位址: {url}", "SUCCESS")
+        messagebox.showinfo("📋 已複製位址", f"【Withny 本機專用】同步位址已複製到剪貼簿：\n\n{url}\n\n適用於電腦本機瀏覽器 (Chrome / Edge / Firefox) 油猴腳本。")
+
+    def start_api_manual_download(self, url, custom_path="Manual_Downloads", plat="自動偵測", quality="best", fmt="mp4"):
+        import random
+        url = smart_redirect_url(url)
+        if not url:
+            return False, "影音網址不能為空"
             
-        urls = []
-        for line in lines:
-            line = line.strip()
-            if line:
-                match = re.search(r'(https?://[^\s]+)', line)
-                if match:
-                    urls.append(match.group(1))
-                    
-        if not urls:
-            messagebox.showwarning("警告", "在選取的檔案中沒有找到任何有效網址！")
-            return
-            
-        custom_path = self.manual_name_entry.get().strip()
         if not custom_path:
             custom_path = "Manual_Downloads"
             
-        import random
-        quality = self.manual_quality_var.get()
-        fmt = self.manual_format_var.get()
-        triggered_count = 0
-        for url in urls:
-            url = smart_redirect_url(url)
-            plat = self.manual_platform_var.get()
-            if plat == "自動偵測":
-                plat = detect_platform(url)
-                
-            display_name = os.path.basename(custom_path) if (":" in custom_path or "/" in custom_path or "\\" in custom_path) else custom_path
-            if not display_name:
-                display_name = "Manual_Download"
-                
-            uid = f"manual_{int(time.time())}_{random.randint(1000, 9999)}"
-            self.active_tasks[uid] = {
-                "channel_name": f"[手動] {display_name}",
-                "platform": plat,
-                "url": url,
-                "status": "佇列中",
-                "progress": 0.0,
-                "speed": "",
-                "size": "",
-                "elapsed": "00:00",
-                "start_time": time.time(),
-                "process": None
-            }
+        if plat == "自動偵測":
+            plat = detect_platform(url)
             
-            self.add_log(f"已手動指派下載任務: {url}", "INFO")
-            t = threading.Thread(target=workers.worker_manual_download, args=(self, uid, url, custom_path, plat, quality, fmt), daemon=True)
-            t.start()
-            triggered_count += 1
+        display_name = os.path.basename(custom_path) if (":" in custom_path or "/" in custom_path or "\\" in custom_path) else custom_path
+        if not display_name:
+            display_name = "Manual_Download"
             
-        self.refresh_tasks_ui()
-        messagebox.showinfo("成功", f"已成功指派 {triggered_count} 個下載任務！")
-        self.select_tab("tasks")
+        uid = f"manual_{int(time.time())}_{random.randint(1000, 9999)}"
+        self.active_tasks[uid] = {
+            "channel_name": f"[遠端手動] {display_name}",
+            "platform": plat,
+            "url": url,
+            "status": "開始下載",
+            "progress": 0.0,
+            "speed": "",
+            "size": "",
+            "elapsed": "00:00",
+            "start_time": time.time(),
+            "process": None
+        }
+        
+        self.add_log(f"🌐 [遠端控制] 手動指派下載任務: {url}", "INFO")
+        try:
+            self.gui_update_queue.put(("refresh_tasks", None))
+        except Exception:
+            pass
+            
+        t = threading.Thread(target=workers.worker_manual_download, args=(self, uid, url, custom_path, plat, quality, fmt), daemon=True)
+        t.start()
+        return True, "已成功啟動手動下載任務"
+
+    def copy_withny_wifi_sync_url(self):
+        current_ip = self.get_current_lan_ip()
+        url = f"http://{current_ip}:18730/update_withny_token"
+        self.clipboard_clear()
+        self.clipboard_append(url)
+        self.add_log(f"📱 已複製 Withny 動態局域網 Token 同步位址: {url}", "SUCCESS")
+        messagebox.showinfo("📱 已複製位址", f"【Withny 跨裝置 Wi-Fi 專用】動態同步位址已複製到剪貼簿：\n\n{url}\n\n目前動態偵測本機 IP: {current_ip}\n適用於手機 Safari (Userscripts/Stay) 或其他連至同 Wi-Fi 之裝置。")
 
     def apply_and_save_settings_gui(self):
         self.settings["rplay_token"] = self.rplay_token_entry.get().strip()
         self.settings["rplay_username"] = self.rplay_username_entry.get().strip()
-        self.settings["rplay_password"] = self.rplay_password_entry.get().strip()
         self.settings["withny_token"] = self.withny_token_entry.get().strip()
         self.settings["download_dir"] = self.download_dir_entry.get().strip().replace("\\", "/")
         self.settings["cookies_file"] = self.cookies_file_entry.get().strip().replace("\\", "/")
         self.settings["fc2_cookies_file"] = self.fc2_cookies_file_entry.get().strip().replace("\\", "/")
-        self.settings["discord_webhook"] = self.discord_webhook_entry.get().strip()
+        self.settings["discord_bot_token"] = self.discord_bot_token_entry.get().strip()
+        self.settings["discord_channel_id"] = self.discord_channel_id_entry.get().strip()
+        self.settings["discord_completed_channel_id"] = self.discord_completed_channel_id_entry.get().strip()
         self.settings["prevent_sleep_mode"] = self.prevent_sleep_menu.get()
         
         try:
             self.settings["max_concurrent_downloads"] = int(self.max_dl_spinner.get().strip())
         except:
             self.settings["max_concurrent_downloads"] = 2
+            
+        raw_cf = self.concurrent_frags_menu.get()
+        try:
+            self.settings["concurrent_fragments"] = int(raw_cf.split()[0])
+        except:
+            self.settings["concurrent_fragments"] = 8
             
         self.settings["yt_quality"] = self.yt_quality_menu.get()
         self.settings["yt_format"] = self.yt_format_menu.get()
@@ -2043,6 +2707,41 @@ class App(ctk.CTk):
         if self.save_settings():
             self.settings_dirty = False
             self.update_sleep_prevention_state()
+            
+            # Rplay Token inspection & diagnostic hint
+            rplay_tok = self.settings.get("rplay_token", "")
+            if rplay_tok:
+                try:
+                    import base64
+                    import json
+                    import time
+                    parts = rplay_tok.split('.')
+                    payload = None
+                    if len(parts) == 3:
+                        p_b64 = parts[1] + '=' * (4 - len(parts[1]) % 4)
+                        payload = json.loads(base64.b64decode(p_b64).decode('utf-8'))
+                    elif len(parts) == 1:
+                        p_b64 = rplay_tok + '=' * (4 - len(rplay_tok) % 4)
+                        payload = json.loads(base64.b64decode(p_b64).decode('utf-8'))
+                    if payload and "exp" in payload:
+                        exp_val = payload["exp"]
+                        if time.time() > exp_val:
+                            exp_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(exp_val))
+                            self.add_log(f"⚠️ 警告: 填入的 Rplay Token 已於 {exp_str} 過期，請至瀏覽器重新複製！", "WARNING")
+                        else:
+                            exp_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(exp_val))
+                            self.add_log(f"✅ Rplay Token 格式有效，到期時間: {exp_str}", "INFO")
+                except:
+                    pass
+                    
+            if getattr(self, 'paused_rplay_task', None) and rplay_tok:
+                from utils import verify_rplay_token
+                is_valid, user_or_err = verify_rplay_token(rplay_tok, self.settings.get("rplay_username"))
+                if is_valid:
+                    task_to_resume = self.paused_rplay_task
+                    self.paused_rplay_task = None
+                    self.resume_paused_rplay_task(task_to_resume)
+                    
             messagebox.showinfo("💾 儲存成功", "設定已成功儲存並同步！")
 
     def on_settings_modified(self, *args):
@@ -2054,9 +2753,6 @@ class App(ctk.CTk):
         
         self.rplay_username_entry.delete(0, "end")
         self.rplay_username_entry.insert(0, self.settings.get("rplay_username", ""))
-        
-        self.rplay_password_entry.delete(0, "end")
-        self.rplay_password_entry.insert(0, self.settings.get("rplay_password", ""))
         
         self.withny_token_entry.delete(0, "end")
         self.withny_token_entry.insert(0, self.settings.get("withny_token", ""))
@@ -2070,11 +2766,27 @@ class App(ctk.CTk):
         self.fc2_cookies_file_entry.delete(0, "end")
         self.fc2_cookies_file_entry.insert(0, self.settings.get("fc2_cookies_file", ""))
         
-        self.discord_webhook_entry.delete(0, "end")
-        self.discord_webhook_entry.insert(0, self.settings.get("discord_webhook", ""))
+        self.discord_bot_token_entry.delete(0, "end")
+        self.discord_bot_token_entry.insert(0, self.settings.get("discord_bot_token", ""))
+        
+        self.discord_channel_id_entry.delete(0, "end")
+        self.discord_channel_id_entry.insert(0, self.settings.get("discord_channel_id", ""))
+        
+        self.discord_completed_channel_id_entry.delete(0, "end")
+        self.discord_completed_channel_id_entry.insert(0, self.settings.get("discord_completed_channel_id", ""))
         
         self.max_dl_spinner.delete(0, "end")
         self.max_dl_spinner.insert(0, str(self.settings.get("max_concurrent_downloads", 2)))
+        
+        cf = self.settings.get("concurrent_fragments", 8)
+        found_cf = False
+        for opt in ["8 通路 (推薦高速)", "16 通路 (極速)", "32 通路 (超速)", "4 通路 (標準)", "1 通路 (單線程)"]:
+            if opt.startswith(f"{cf} "):
+                self.concurrent_frags_menu.set(opt)
+                found_cf = True
+                break
+        if not found_cf:
+            self.concurrent_frags_menu.set(f"{cf} 通路")
         
         self.yt_quality_menu.set(self.settings.get("yt_quality", "best"))
         self.yt_format_menu.set(self.settings.get("yt_format", "mp4"))
@@ -2116,30 +2828,31 @@ class App(ctk.CTk):
         
         # Header
         header_frame = ctk.CTkFrame(logs_frame, fg_color="transparent")
-        header_frame.grid(row=0, column=0, padx=15, pady=(10, 15), sticky="ew")
+        header_frame.grid(row=0, column=0, padx=12, pady=(10, 15), sticky="ew")
         header_frame.grid_columnconfigure(0, weight=1)
         
-        ctk.CTkLabel(header_frame, text="📝 系統日誌與連線狀態", font=ctk.CTkFont(size=18, weight="bold"), text_color=self.c_text_primary).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(header_frame, text="📝 系統日誌與連線狀態", font=ctk.CTkFont(family="Segoe UI Variable Text", size=16, weight="bold"), text_color=self.c_text_primary).grid(row=0, column=0, sticky="w")
         
-        clear_btn = ctk.CTkButton(header_frame, text="🧹 清空日誌", fg_color="gray30", hover_color="gray40", text_color=self.c_text_primary, font=ctk.CTkFont(weight="bold"), command=self.clear_logs)
+        clear_btn = ctk.CTkButton(header_frame, text="🧹 清空日誌", fg_color="#1e293b", hover_color="#334155", text_color=self.c_text_primary, height=30, corner_radius=6, font=ctk.CTkFont(family="Segoe UI Variable Text", size=12, weight="bold"), command=self.clear_logs)
         clear_btn.grid(row=0, column=1, sticky="e")
         
         # Consolas console terminal log window
         self.log_textbox = ctk.CTkTextbox(
             logs_frame, 
-            font=ctk.CTkFont(family="Consolas", size=12),
+            font=ctk.CTkFont(family="Consolas", size=13),
             fg_color=self.c_sidebar,
             border_color=self.c_card_border,
             border_width=1,
+            corner_radius=8,
             text_color=self.c_text_primary
         )
-        self.log_textbox.grid(row=1, column=0, padx=15, pady=5, sticky="nsew")
+        self.log_textbox.grid(row=1, column=0, padx=12, pady=5, sticky="nsew")
         self.log_textbox.configure(state="disabled")
         
         # Setup specific console colors matching log levels
-        self.log_textbox.tag_config("SUCCESS", foreground=self.c_green)
-        self.log_textbox.tag_config("WARNING", foreground=self.c_yellow)
-        self.log_textbox.tag_config("ERROR", foreground=self.c_red)
+        self.log_textbox.tag_config("SUCCESS", foreground=self.c_green_text)
+        self.log_textbox.tag_config("WARNING", foreground=self.c_yellow_text)
+        self.log_textbox.tag_config("ERROR", foreground=self.c_red_text)
         self.log_textbox.tag_config("INFO", foreground=self.c_text_primary)
 
     def clear_logs(self):
@@ -2156,9 +2869,9 @@ class App(ctk.CTk):
         
         # Header Area
         header_frame = ctk.CTkFrame(updates_frame, fg_color="transparent")
-        header_frame.grid(row=0, column=0, padx=15, pady=(10, 15), sticky="ew")
+        header_frame.grid(row=0, column=0, padx=12, pady=(10, 15), sticky="ew")
         
-        ctk.CTkLabel(header_frame, text="🔄 系統元件與依賴更新", font=ctk.CTkFont(size=18, weight="bold"), text_color=self.c_text_primary).pack(side="left")
+        ctk.CTkLabel(header_frame, text="🔄 系統元件與依賴更新", font=ctk.CTkFont(family="Segoe UI Variable Text", size=16, weight="bold"), text_color=self.c_text_primary).pack(side="left")
         
         self.btn_check_updates = ctk.CTkButton(
             header_frame, 
@@ -2166,27 +2879,29 @@ class App(ctk.CTk):
             fg_color=self.c_accent, 
             hover_color=self.c_accent_hover, 
             text_color=self.c_text_primary,
-            font=ctk.CTkFont(weight="bold"),
+            height=32,
+            corner_radius=6,
+            font=ctk.CTkFont(family="Segoe UI Variable Text", size=12, weight="bold"),
             command=self.check_all_updates_async
         )
         self.btn_check_updates.pack(side="right")
         
         # Component Grid / Scroll Frame
-        scroll_updates = ctk.CTkScrollableFrame(updates_frame, fg_color=self.c_frame, border_color=self.c_card_border, border_width=1, corner_radius=12, height=320)
-        scroll_updates.grid(row=1, column=0, padx=15, pady=5, sticky="ew")
+        scroll_updates = ctk.CTkScrollableFrame(updates_frame, fg_color=self.c_frame, border_color=self.c_card_border, border_width=1, corner_radius=12, height=310)
+        scroll_updates.grid(row=1, column=0, padx=12, pady=5, sticky="ew")
         scroll_updates.grid_columnconfigure((0, 1), weight=1)
         
         # Components Data List
         self.comp_ui = {}
         
         components = [
-            ("ytdlp", "🔴 yt-dlp 下載核心", lambda: updater.get_local_version_ytdlp(self), self.update_ytdlp_async),
+            ("ytdlp", "🔴 yt-dlp 下載核心 (含原生擴展)", lambda: updater.get_local_version_ytdlp(self), self.update_ytdlp_async),
             ("ffmpeg", "🎞️ FFmpeg 解碼器", lambda: updater.get_local_version_ffmpeg(self), self.update_ffmpeg_async),
-            ("rplay", "🔗 Rplay 提取擴充", lambda: updater.get_local_version_rplay(self), self.update_rplay_async),
-            ("withnydl", "🟣 Withny-dl 監控器", lambda: updater.get_local_version_withnydl(self), self.update_withnydl_async)
+            ("rplay", "🔗 Rplay 原生核心 (Native)", lambda: updater.get_local_version_rplay(self), self.update_rplay_async),
+            ("withnydl", "🟣 Withny 原生核心 (Native)", lambda: updater.get_local_version_withnydl(self), self.update_withnydl_async)
         ]
         
-        form_label_font = ctk.CTkFont(size=13, weight="bold")
+        form_label_font = ctk.CTkFont(family="Segoe UI Variable Text", size=11, weight="bold")
         
         for idx, (cid, name, loc_func, update_func) in enumerate(components):
             card = ctk.CTkFrame(
@@ -2194,26 +2909,26 @@ class App(ctk.CTk):
                 fg_color=self.c_card, 
                 border_color=self.c_card_border, 
                 border_width=1, 
-                corner_radius=12
+                corner_radius=8
             )
             r = idx // 2
             c = idx % 2
-            card.grid(row=r, column=c, padx=10, pady=10, sticky="nsew")
+            card.grid(row=r, column=c, padx=8, pady=8, sticky="nsew")
             card.grid_columnconfigure(1, weight=1)
             
             # Content layout
-            ctk.CTkLabel(card, text=name, font=ctk.CTkFont(size=14, weight="bold"), text_color=self.c_text_primary).grid(row=0, column=0, columnspan=3, padx=15, pady=(12, 6), sticky="w")
+            ctk.CTkLabel(card, text=name, font=ctk.CTkFont(family="Segoe UI Variable Text", size=13, weight="bold"), text_color=self.c_text_primary).grid(row=0, column=0, columnspan=3, padx=12, pady=(10, 4), sticky="w")
             
             # Local Version Info
-            ctk.CTkLabel(card, text="本機版本:", font=form_label_font, text_color=self.c_text_secondary).grid(row=1, column=0, padx=15, pady=3, sticky="w")
-            lbl_loc = ctk.CTkLabel(card, text="檢測中...", text_color=self.c_text_primary)
-            lbl_loc.grid(row=1, column=1, padx=5, pady=3, sticky="w")
+            ctk.CTkLabel(card, text="本機版本:", font=form_label_font, text_color=self.c_text_secondary).grid(row=1, column=0, padx=12, pady=2, sticky="w")
+            lbl_loc = ctk.CTkLabel(card, text="檢測中...", font=ctk.CTkFont(family="Segoe UI Variable Text", size=11), text_color=self.c_text_primary)
+            lbl_loc.grid(row=1, column=1, padx=4, pady=2, sticky="w")
             
             # Online Version Info
-            ctk.CTkLabel(card, text="最新線上:", font=form_label_font, text_color=self.c_text_secondary).grid(row=2, column=0, padx=15, pady=3, sticky="w")
+            ctk.CTkLabel(card, text="最新線上:", font=form_label_font, text_color=self.c_text_secondary).grid(row=2, column=0, padx=12, pady=2, sticky="w")
             
-            lbl_online = ctk.CTkLabel(card, text="未檢查", text_color=self.c_text_secondary)
-            lbl_online.grid(row=2, column=1, padx=5, pady=3, sticky="w")
+            lbl_online = ctk.CTkLabel(card, text="未檢查", font=ctk.CTkFont(family="Segoe UI Variable Text", size=11), text_color=self.c_text_secondary)
+            lbl_online.grid(row=2, column=1, padx=4, pady=2, sticky="w")
             if cid == "ytdlp":
                 self.lbl_online_ytdlp = lbl_online
             elif cid == "ffmpeg":
@@ -2224,8 +2939,8 @@ class App(ctk.CTk):
                 self.lbl_online_withnydl = lbl_online
                 
             # Status Badge indicator
-            lbl_status = ctk.CTkLabel(card, text="未檢查 ⚪", text_color=self.c_text_secondary, font=ctk.CTkFont(weight="bold"))
-            lbl_status.grid(row=1, column=2, rowspan=2, padx=15, pady=3, sticky="e")
+            lbl_status = ctk.CTkLabel(card, text="未檢查 ⚪", text_color=self.c_text_muted, font=ctk.CTkFont(family="Segoe UI Variable Text", size=10, weight="bold"))
+            lbl_status.grid(row=1, column=2, rowspan=2, padx=12, pady=2, sticky="e")
             if cid == "ytdlp":
                 self.lbl_status_ytdlp = lbl_status
             elif cid == "ffmpeg":
@@ -2242,11 +2957,12 @@ class App(ctk.CTk):
                 fg_color=self.c_accent, 
                 hover_color=self.c_accent_hover,
                 text_color=self.c_text_primary,
-                font=ctk.CTkFont(weight="bold"),
-                height=30,
+                font=ctk.CTkFont(family="Segoe UI Variable Text", size=11, weight="bold"),
+                height=28,
+                corner_radius=6,
                 command=update_func
             )
-            btn_update.grid(row=3, column=0, columnspan=3, padx=15, pady=(8, 15), sticky="ew")
+            btn_update.grid(row=3, column=0, columnspan=3, padx=12, pady=(6, 12), sticky="ew")
             
             self.comp_ui[cid] = {
                 "lbl_loc": lbl_loc,
@@ -2259,7 +2975,7 @@ class App(ctk.CTk):
         # Logging text terminal for Updates
         self.updates_textbox = ctk.CTkTextbox(
             updates_frame, 
-            font=ctk.CTkFont(family="Consolas", size=12),
+            font=ctk.CTkFont(family="Consolas", size=13),
             fg_color=self.c_sidebar,
             border_color=self.c_card_border,
             border_width=1,
@@ -2336,7 +3052,7 @@ class App(ctk.CTk):
     def update_rplay_async(self):
         if not self.check_safe_to_update():
             return
-        self.updates_log("🔔 開始更新 Rplay Extractor...\n")
+        self.updates_log("🔔 開始更新 Rplay 下載核心...\n")
         self.disable_update_buttons()
         threading.Thread(target=updater.worker_update_rplay, args=(self,), daemon=True).start()
 
@@ -2413,7 +3129,7 @@ class App(ctk.CTk):
                     else:
                         self.lbl_status_ffmpeg.configure(text="未偵測到", text_color=self.c_text_secondary)
                         
-                    # Rplay Extractor
+                    # Rplay
                     self.lbl_online_rplay.configure(text=latest_rplay, text_color=self.c_text_primary)
                     loc_rplay = updater.get_local_version_rplay(self)
                     if latest_rplay != "未知" and loc_rplay != "未偵測到":
@@ -2449,6 +3165,12 @@ class App(ctk.CTk):
                     comp_name = data
                     self.add_log(f"更新失敗: {comp_name}", "ERROR")
                     self.enable_update_buttons()
+                elif evt_type == "refresh_settings_ui":
+                    self.reset_settings_fields_from_state()
+                elif evt_type == "start_monitoring":
+                    self.start_monitoring()
+                elif evt_type == "stop_monitoring":
+                    self.stop_monitoring()
             except queue.Empty:
                 break
                 
@@ -2457,6 +3179,36 @@ class App(ctk.CTk):
                 
         # Schedule next poll
         self.after(100, self.poll_gui_updates)
+
+    def start_periodic_task_timer(self):
+        current_time = time.time()
+        any_active = False
+        for uid, task in list(self.active_tasks.items()):
+            status = task.get("status", "")
+            if status not in ["佇列中", "已完成", "失敗"]:
+                any_active = True
+                start_time = task.get("start_time")
+                if start_time:
+                    elapsed_sec = int(current_time - start_time)
+                    hours = elapsed_sec // 3600
+                    mins = (elapsed_sec % 3600) // 60
+                    secs = elapsed_sec % 60
+                    if hours > 0:
+                        task["elapsed"] = f"{hours:02d}:{mins:02d}:{secs:02d}"
+                    else:
+                        task["elapsed"] = f"{mins:02d}:{secs:02d}"
+                        
+                    # Discord status message updates (every 60 seconds)
+                    if task.get("discord_message_id"):
+                        last_update = task.get("last_discord_update_sec", 0)
+                        if last_update == 0 or (elapsed_sec - last_update >= 60):
+                            task["last_discord_update_sec"] = elapsed_sec
+                            self.discord_notify_update(uid)
+                            
+        if any_active:
+            self.refresh_tasks_ui()
+            
+        self.after(1000, self.start_periodic_task_timer)
 
     # ================= Sleep Prevention & Cleanups =================
     def update_sleep_prevention_state(self):
@@ -2588,25 +3340,565 @@ class App(ctk.CTk):
             return None, 0
 
     # ================= Discord Notification Helper =================
-    def send_discord_notify(self, url, title, custom_name, platform="直播", include_url=True, image_url=None):
-        webhook = self.settings["discord_webhook"]
-        if not webhook or "http" not in webhook:
+    def get_discord_credentials(self, use_completed=False):
+        token = self.settings.get("discord_bot_token", "").strip().strip('"').strip("'")
+        if token.lower().startswith("bot "):
+            token = token[4:].strip().strip('"').strip("'")
+        if use_completed:
+            channel_id = self.settings.get("discord_completed_channel_id", "").strip().strip('"').strip("'")
+            if not channel_id:
+                channel_id = self.settings.get("discord_channel_id", "").strip().strip('"').strip("'")
+        else:
+            channel_id = self.settings.get("discord_channel_id", "").strip().strip('"').strip("'")
+        return token, channel_id
+
+    def discord_notify_start(self, uid, url, title, custom_name, platform, image_url=None, can_record=False):
+        token, channel_id = self.get_discord_credentials(use_completed=False)
+        if not token or not channel_id:
             return
-        content = f"🚨 **{title}**\n名稱: {custom_name}"
-        if include_url:
-            content += f"\n網址: {url}"
-        payload = {"username": f"{platform} 監控小幫手", "content": content}
-        if image_url:
-            payload["embeds"] = [{"image": {"url": image_url}}]
             
+        task = self.active_tasks.get(uid)
+        if task:
+            task["image_url"] = image_url
+            task["channel_url"] = url
+            if task.get("discord_message_id"):
+                self.discord_notify_update(uid)
+                return
+            
+        iso_timestamp = datetime.utcnow().isoformat() + "Z"
+        embed = {
+            "title": f"🔴 [直播中] {custom_name}",
+            "url": url,
+            "description": "⏳ 已下載時間: 0秒",
+            "color": 16711680, # Red
+            "footer": {"text": "每分鐘自動更新 • StreamBot"},
+            "timestamp": iso_timestamp
+        }
+        if image_url:
+            embed["image"] = {"url": image_url}
+            
+        payload = {"embeds": [embed]}
+        if can_record:
+            payload["components"] = [
+                {
+                    "type": 1,
+                    "components": [
+                        {
+                            "type": 2,
+                            "style": 1,
+                            "label": "🔴 開始錄製",
+                            "custom_id": f"start_rec_{uid}"
+                        }
+                    ]
+                }
+            ]
+        headers = {
+            "Authorization": f"Bot {token}",
+            "Content-Type": "application/json"
+        }
+        
         def _send():
             try:
                 import requests
-                requests.post(webhook, json=payload, timeout=10)
+                res = requests.post(f"https://discord.com/api/v10/channels/{channel_id}/messages", json=payload, headers=headers, timeout=10)
+                if res.status_code in [200, 201]:
+                    msg_id = res.json().get("id")
+                    if uid in self.ended_discord_tasks:
+                        self.ended_discord_tasks.discard(uid)
+                        requests.delete(f"https://discord.com/api/v10/channels/{channel_id}/messages/{msg_id}", headers=headers, timeout=10)
+                    elif uid in self.active_tasks:
+                        self.active_tasks[uid]["discord_message_id"] = msg_id
+                        self.active_tasks[uid]["last_discord_update_sec"] = 0
+                    else:
+                        requests.delete(f"https://discord.com/api/v10/channels/{channel_id}/messages/{msg_id}", headers=headers, timeout=10)
+                else:
+                    self.add_log(f"Discord Bot 傳送狀態訊息失敗 (HTTP {res.status_code}): {res.text}", "WARNING")
             except Exception as e:
-                print(f"Discord notification failed: {e}")
+                self.add_log(f"Discord Bot notify start failed: {e}", "WARNING")
                 
         threading.Thread(target=_send, daemon=True).start()
+
+    def discord_notify_update(self, uid):
+        token, channel_id = self.get_discord_credentials(use_completed=False)
+        if not token or not channel_id:
+            return
+            
+        if uid in self.ended_discord_tasks:
+            return
+            
+        task = self.active_tasks.get(uid)
+        if not task:
+            return
+            
+        msg_id = task.get("discord_message_id")
+        if not msg_id:
+            return
+            
+        status = task.get("status", "")
+        is_notify_only = status == "直播中(僅通知)"
+        
+        elapsed_sec = int(time.time() - task.get("start_time", time.time()))
+        duration_zh = format_duration_zh(elapsed_sec)
+        url = task.get("channel_url") or task.get("url", "")
+        image_url = task.get("image_url")
+        
+        iso_timestamp = datetime.utcnow().isoformat() + "Z"
+        
+        description = f"⏳ 已下載時間: {duration_zh}"
+        if is_notify_only:
+            description = f"⏳ 直播中 (僅通知) • 已進行: {duration_zh}"
+            
+        embed = {
+            "title": f"🔴 [直播中] {task.get('channel_name')}",
+            "url": url,
+            "description": description,
+            "color": 16711680,
+            "footer": {"text": "每分鐘自動更新 • StreamBot"},
+            "timestamp": iso_timestamp
+        }
+        if image_url:
+            embed["image"] = {"url": image_url}
+            
+        payload = {"embeds": [embed]}
+        if is_notify_only:
+            payload["components"] = [
+                {
+                    "type": 1,
+                    "components": [
+                        {
+                            "type": 2,
+                            "style": 1,
+                            "label": "🔴 開始錄製",
+                            "custom_id": f"start_rec_{uid}"
+                        }
+                    ]
+                }
+            ]
+        elif task.get("was_notify_only"):
+            payload["components"] = [
+                {
+                    "type": 1,
+                    "components": [
+                        {
+                            "type": 2,
+                            "style": 2,
+                            "label": "⏺️ 錄製中",
+                            "custom_id": f"start_rec_{uid}",
+                            "disabled": True
+                        }
+                    ]
+                }
+            ]
+        headers = {
+            "Authorization": f"Bot {token}",
+            "Content-Type": "application/json"
+        }
+        
+        def _update():
+            try:
+                import requests
+                res = requests.patch(f"https://discord.com/api/v10/channels/{channel_id}/messages/{msg_id}", json=payload, headers=headers, timeout=10)
+                if res.status_code not in [200, 201]:
+                    self.add_log(f"Discord Bot 更新狀態訊息失敗 (HTTP {res.status_code}): {res.text}", "WARNING")
+            except Exception as e:
+                print(f"Discord Bot notify update failed: {e}")
+                
+        threading.Thread(target=_update, daemon=True).start()
+
+    def discord_notify_end(self, uid, msg_id=None, has_saved=True):
+        token, status_channel_id = self.get_discord_credentials(use_completed=False)
+        _, completed_channel_id = self.get_discord_credentials(use_completed=True)
+        if not token:
+            return
+            
+        self.ended_discord_tasks.add(uid)
+        
+        task = self.active_tasks.get(uid)
+        if not msg_id and task:
+            msg_id = task.get("discord_message_id")
+            
+        headers = {
+            "Authorization": f"Bot {token}",
+            "Content-Type": "application/json"
+        }
+        
+        payload_comp = None
+        if task and has_saved:
+            channel_name = task.get("channel_name", "未知頻道")
+            platform = task.get("platform", "未知平台")
+            url = task.get("channel_url") or task.get("url", "")
+            
+            elapsed_sec = int(time.time() - task.get("start_time", time.time()))
+            duration_zh = format_duration_zh(elapsed_sec)
+            
+            iso_timestamp = datetime.utcnow().isoformat() + "Z"
+            
+            comp_embed = {
+                "title": f"✅ [下載完成] {channel_name}",
+                "description": f"**平台**: {platform}",
+                "color": 3066993, # Green
+                "fields": [
+                    {"name": "錄製時間", "value": f"⏳ {duration_zh}", "inline": True}
+                ],
+                "footer": {"text": "下載完成 • StreamBot"},
+                "timestamp": iso_timestamp
+            }
+            if url:
+                comp_embed["fields"].append({"name": "直播網址", "value": f"[點此前往]({url})", "inline": False})
+                
+            payload_comp = {"embeds": [comp_embed]}
+            
+        def _delete_and_notify():
+            try:
+                import requests
+                if payload_comp and completed_channel_id:
+                    res_comp = requests.post(f"https://discord.com/api/v10/channels/{completed_channel_id}/messages", json=payload_comp, headers=headers, timeout=10)
+                    if res_comp.status_code not in [200, 201]:
+                        self.add_log(f"Discord Bot 傳送完成訊息失敗 (HTTP {res_comp.status_code}): {res_comp.text}", "WARNING")
+                
+                if msg_id and status_channel_id:
+                    res = requests.delete(f"https://discord.com/api/v10/channels/{status_channel_id}/messages/{msg_id}", headers={"Authorization": f"Bot {token}"}, timeout=10)
+                    if res.status_code not in [200, 204]:
+                        is_unknown_msg = False
+                        try:
+                            res_json = res.json()
+                            if res_json.get("code") == 10008 or "Unknown Message" in res.text:
+                                is_unknown_msg = True
+                        except:
+                            pass
+                        if not is_unknown_msg:
+                            self.add_log(f"Discord Bot 刪除狀態訊息失敗 (HTTP {res.status_code}): {res.text}", "WARNING")
+            except Exception as e:
+                print(f"Discord Bot notify end failed: {e}")
+                
+        threading.Thread(target=_delete_and_notify, daemon=True).start()
+
+    def discord_notify_simple(self, url, title, custom_name, platform="直播", image_url=None):
+        return
+
+    def start_discord_gateway(self):
+        token, _ = self.get_discord_credentials()
+        if token and (self.discord_gw_thread is None or not self.discord_gw_thread.is_alive()):
+            self.discord_gw_thread = threading.Thread(target=self.run_discord_gateway, daemon=True)
+            self.discord_gw_thread.start()
+
+    def run_discord_gateway(self):
+        token, _ = self.get_discord_credentials()
+        if not token:
+            return
+            
+        import websocket
+        import json
+        
+        self.add_log("Discord Gateway: 正在連線以接收遠端指令並上線機器人...", "INFO")
+        heartbeat_thread = None
+        stop_heartbeat = threading.Event()
+        current_intents = [33281] # Guilds (1) | Guild Messages (512) | Message Content (32768)
+        
+        def on_message(ws, message):
+            try:
+                data = json.loads(message)
+                op = data.get("op")
+                if op == 10: # Hello
+                    interval = data["d"]["heartbeat_interval"] / 1000.0
+                    stop_heartbeat.clear()
+                    
+                    def heartbeat():
+                        while not stop_heartbeat.is_set():
+                            time.sleep(interval)
+                            if stop_heartbeat.is_set():
+                                break
+                            try:
+                                ws.send(json.dumps({"op": 1, "d": None}))
+                            except:
+                                break
+                                
+                    nonlocal heartbeat_thread
+                    heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
+                    heartbeat_thread.start()
+                    
+                    # Send Identify
+                    identify_payload = {
+                        "op": 2,
+                        "d": {
+                            "token": token,
+                            "intents": current_intents[0],
+                            "properties": {
+                                "os": "windows",
+                                "browser": "StreamBot",
+                                "device": "StreamBot"
+                            },
+                            "presence": {
+                                "status": "online",
+                                "activities": [{
+                                    "name": "!help | StreamBot 遙控",
+                                    "type": 0
+                                }],
+                                "afk": False
+                            }
+                        }
+                    }
+                    ws.send(json.dumps(identify_payload))
+                elif op == 9: # Invalid Session
+                    self.add_log("Discord Gateway: 連線工作階段無效 (Invalid Session)！", "WARNING")
+                elif op == 0: # Dispatch
+                    t = data.get("t")
+                    d = data.get("d")
+                    if t == "MESSAGE_CREATE":
+                        self.handle_discord_message(d)
+                    elif t == "INTERACTION_CREATE":
+                        self.handle_discord_interaction(d)
+            except Exception as e:
+                print(f"Discord gateway on_message error: {e}")
+                
+        def on_error(ws, error):
+            self.add_log(f"Discord Gateway 連線出錯: {error}", "WARNING")
+            
+        should_reconnect = [True]
+        
+        def on_close(ws, close_status_code, close_msg):
+            stop_heartbeat.set()
+            if close_status_code:
+                if close_status_code == 4004:
+                    self.add_log("Discord Gateway 連線關閉 (4004): 驗證失敗！請檢查 Bot Token 是否正確。", "ERROR")
+                    should_reconnect[0] = False
+                elif close_status_code == 4014:
+                    if current_intents[0] == 33281:
+                        self.add_log("Discord Gateway: 缺少 Message Content 特權 Intent，切換至基本權限重試...", "WARNING")
+                        current_intents[0] = 513 # Fallback without Message Content Intent
+                    else:
+                        self.add_log("Discord Gateway 連線關閉 (4014): 缺少特權 Intent！", "ERROR")
+                        should_reconnect[0] = False
+                else:
+                    self.add_log(f"Discord Gateway 連線關閉 ({close_status_code}): {close_msg}", "WARNING")
+            else:
+                self.add_log("Discord Gateway 連線已關閉。", "INFO")
+            
+        def on_open(ws):
+            self.add_log("Discord Gateway: 已建立連線，機器人在線並已啟用遠端指令監聽！", "SUCCESS")
+            
+        # Keep Gateway active 24/7 in background to process remote commands anytime
+        while should_reconnect[0]:
+            token, _ = self.get_discord_credentials()
+            if not token:
+                break
+                
+            self.discord_ws = websocket.WebSocketApp(
+                "wss://gateway.discord.gg/?v=10&encoding=json",
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close
+            )
+            
+            self.discord_ws.run_forever()
+            stop_heartbeat.set()
+            if not should_reconnect[0]:
+                break
+            time.sleep(5) # Reconnect delay
+
+    def handle_discord_message(self, d):
+        import requests
+        
+        author = d.get("author", {})
+        if author.get("bot"):
+            return # Ignore bot messages
+            
+        content = d.get("content", "").strip()
+        if not content:
+            return
+            
+        # Check command prefixes (! or / or ！)
+        if not (content.startswith("!") or content.startswith("/") or content.startswith("！")):
+            return
+            
+        channel_id = d.get("channel_id")
+        msg_id = d.get("id")
+        token, _ = self.get_discord_credentials()
+        if not token or not channel_id:
+            return
+            
+        def reply(text="", embed=None):
+            headers = {
+                "Authorization": f"Bot {token}",
+                "Content-Type": "application/json"
+            }
+            payload = {}
+            if text:
+                payload["content"] = text
+            if embed:
+                payload["embeds"] = [embed]
+            payload["message_reference"] = {"message_id": msg_id}
+            
+            def _send():
+                try:
+                    requests.post(f"https://discord.com/api/v10/channels/{channel_id}/messages", json=payload, headers=headers, timeout=10)
+                except Exception as e:
+                    print(f"Discord command reply error: {e}")
+            threading.Thread(target=_send, daemon=True).start()
+
+        # Parse command & arguments
+        parts = content.split()
+        cmd_raw = parts[0]
+        cmd_name = cmd_raw.lstrip("!/！").lower()
+        args = parts[1:]
+
+        # 1. 啟動監控
+        if cmd_name in ("start", "啟動", "開啟", "監控", "啟動監控", "開啟監控"):
+            if self.is_monitoring:
+                reply("ℹ️ StreamBot 目前已經在監控中了！")
+            else:
+                self.gui_update_queue.put(("start_monitoring", None))
+                self.add_log("🤖 [Discord 指令] 收到 !start 遠端指令，正在啟動全域監控...", "INFO")
+                embed = {
+                    "title": "🟢 全域監控已啟動",
+                    "description": f"已成功啟動 StreamBot 全域監控！\n目前監控頻道數: **{len(self.channels)}** 個",
+                    "color": 3066993, # Green
+                    "footer": {"text": "StreamBot 遠端遙控"}
+                }
+                reply(embed=embed)
+
+        # 2. 停止監控
+        elif cmd_name in ("stop", "停止", "關閉", "停止監控", "關閉監控"):
+            if not self.is_monitoring:
+                reply("ℹ️ StreamBot 目前處於靜止待命狀態，未在監控中。")
+            else:
+                self.gui_update_queue.put(("stop_monitoring", None))
+                self.add_log("🤖 [Discord 指令] 收到 !stop 遠端指令，正在停止全域監控...", "INFO")
+                embed = {
+                    "title": "🛑 全域監控已停止",
+                    "description": "已成功停止 StreamBot 全域監控，系統進入待命狀態。",
+                    "color": 15158332, # Red
+                    "footer": {"text": "StreamBot 遠端遙控"}
+                }
+                reply(embed=embed)
+
+        # 3. 手動下載
+        elif cmd_name in ("dl", "download", "下載", "手動下載"):
+            if len(args) < 1:
+                reply("⚠️ 請提供要下載的直播/影片網址！\n**使用範例**: `!dl https://rplay.live/live/... [自訂名稱]`")
+                return
+            target_url = args[0].strip()
+            custom_name = " ".join(args[1:]).strip() if len(args) > 1 else "Discord_Manual_Download"
+            ok, msg = self.start_api_manual_download(target_url, custom_name)
+            if ok:
+                self.add_log(f"🤖 [Discord 指令] 收到 !dl 遠端手動下載指令: {target_url}", "INFO")
+                plat = detect_platform(target_url)
+                embed = {
+                    "title": "🚀 手動下載任務已指派",
+                    "description": f"**平台**: {plat}\n**名稱**: {custom_name}\n**網址**: [點此前往]({target_url})",
+                    "color": 10181046, # Purple
+                    "footer": {"text": "StreamBot 手動下載"}
+                }
+                reply(embed=embed)
+            else:
+                reply(f"❌ 手動下載指派失敗: {msg}")
+
+        # 4. 查看狀態
+        elif cmd_name in ("status", "狀態", "info"):
+            active_count = len(self.active_tasks)
+            status_text = "🟢 監控中 (即時輪詢各頻道)" if self.is_monitoring else "🔴 待命中 (全域監控已關閉)"
+            tasks_desc = ""
+            if active_count > 0:
+                tasks_desc = "\n\n**⚡ 進行中任務**:\n"
+                for uid, t in list(self.active_tasks.items()):
+                    pct = int(t.get("progress", 0) * 100) if t.get("progress", 0) >= 0 else ""
+                    pct_str = f" ({pct}%)" if pct != "" else ""
+                    tasks_desc += f"• **{t.get('channel_name', '未知')}** [{t.get('platform', '')}]: `{t.get('status', '')}`{pct_str} {t.get('speed', '')}\n"
+            else:
+                tasks_desc = "\n\n目前無正在錄影或下載的任務。"
+
+            embed = {
+                "title": "📊 StreamBot 運行狀態",
+                "description": f"**監控狀態**: {status_text}\n**監控頻道數**: {len(self.channels)} 個\n**執行中任務**: {active_count} 個{tasks_desc}",
+                "color": 3447003 if self.is_monitoring else 15158332,
+                "footer": {"text": "StreamBot Status"}
+            }
+            reply(embed=embed)
+
+        # 5. 查詢電腦 IP 與遠端遙控/同步位址
+        elif cmd_name in ("ip", "位址", "網址", "lan"):
+            lan_ip = self.get_current_lan_ip()
+            embed = {
+                "title": "🌐 StreamBot 區域網路連線與遠端位址",
+                "description": f"目前電腦區域網路 IP: **`{lan_ip}`**\n（同 Wi-Fi 下手機或設備可透過以下網址進行遙控與同步）",
+                "color": 49151, # Cyan
+                "fields": [
+                    {
+                        "name": "📱 Web 遠端遙控網頁",
+                        "value": f"[http://{lan_ip}:18730/](http://{lan_ip}:18730/)\n*(本機: `http://127.0.0.1:18730/`)*",
+                        "inline": False
+                    },
+                    {
+                        "name": "🎵 Rplay 手機/跨裝置同步位址",
+                        "value": f"`http://{lan_ip}:18730/update_token`",
+                        "inline": False
+                    },
+                    {
+                        "name": "🪐 Withny 手機/跨裝置同步位址",
+                        "value": f"`http://{lan_ip}:18730/update_withny_token`",
+                        "inline": False
+                    }
+                ],
+                "footer": {"text": "StreamBot IP & Remote Links"}
+            }
+            reply(embed=embed)
+
+        # 6. 指令說明
+        elif cmd_name in ("help", "指令", "說明", "h"):
+            embed = {
+                "title": "🤖 StreamBot Discord 指令清單",
+                "description": "您可以在 Discord 頻道輸入以下指令遠端控制 StreamBot：",
+                "color": 3447003,
+                "fields": [
+                    {"name": "▶️ 啟動全域監控", "value": "`!start` 或 `!監控`", "inline": False},
+                    {"name": "🛑 停止全域監控", "value": "`!stop` 或 `!停止`", "inline": False},
+                    {"name": "🚀 手動下載直播/影片", "value": "`!dl <網址> [名稱]` 或 `!download <網址>`", "inline": False},
+                    {"name": "🌐 查詢電腦 IP 與遠端位址", "value": "`!ip` 或 `!位址`", "inline": False},
+                    {"name": "📊 查看即時狀態與任務", "value": "`!status` 或 `!狀態`", "inline": False},
+                    {"name": "❓ 查看指令說明", "value": "`!help` 或 `!指令`", "inline": False}
+                ],
+                "footer": {"text": "StreamBot Discord 遠端控制器"}
+            }
+            reply(embed=embed)
+
+    def handle_discord_interaction(self, d):
+        import requests
+        
+        interaction_id = d.get("id")
+        token = d.get("token")
+        
+        # Acknowledge the interaction immediately to avoid client timeout errors
+        try:
+            requests.post(
+                f"https://discord.com/api/v10/interactions/{interaction_id}/{token}/callback",
+                json={"type": 6},
+                headers={"Content-Type": "application/json"},
+                timeout=5
+            )
+        except Exception as e:
+            self.add_log(f"回應 Discord 互動失敗: {e}", "WARNING")
+            
+        int_data = d.get("data", {})
+        custom_id = int_data.get("custom_id", "")
+        if custom_id.startswith("start_rec_"):
+            uid = custom_id[len("start_rec_"):]
+            
+            task = self.active_tasks.get(uid)
+            if task and task.get("status") == "直播中(僅通知)":
+                self.add_log(f"收到 Discord 錄製指令：正在為 [{task.get('channel_name')}] 啟動錄影...", "SUCCESS")
+                
+                # Transition status and reference target to enable recording
+                task["was_notify_only"] = True
+                task["status"] = "準備錄影"
+                
+                target = task.get("target_ref")
+                if target:
+                    target["record"] = True
+                                
+                self.discord_notify_update(uid)
+                self.gui_update_queue.put(("refresh_tasks", None))
+                self.gui_update_queue.put(("refresh_channels_list", None))
 
     # ================= Monitoring Control =================
     def toggle_monitoring(self):
@@ -2620,16 +3912,24 @@ class App(ctk.CTk):
             self.add_log("啟動監控失敗：沒有設定監控的頻道！", "WARNING")
             return
             
+        self.monitor_session_id += 1
         self.is_monitoring = True
-        self.monitor_btn.configure(text="🛑 停止監控", fg_color=self.c_red, hover_color="#db3b3b")
-        self.add_log("系統開始監控...", "INFO")
+        self.monitor_btn.configure(text="🛑 停止全域監控", fg_color=self.c_red, hover_color="#e11d48")
+        if hasattr(self, "sidebar_status_badge"):
+            self.sidebar_status_badge.configure(text="● 監控運行中", text_color=self.c_blue_text)
+        self.add_log("系統開始全域頻道監控...", "INFO")
+        
+        # Check Rplay credentials on startup / monitoring launch asynchronously
+        threading.Thread(target=self.check_rplay_credentials_on_startup, daemon=True).start()
+        
+        # Ensure Discord Gateway is running for status and remote command control
+        self.start_discord_gateway()
         
         clean_path, count = self.prepare_clean_cookies()
         if clean_path:
             self.add_log(f"已淨化並載入 Cookie ({count} 筆)", "SUCCESS")
             
         self.monitor_threads = []
-        withny_record_targets = {}
         
         for idx, channel in enumerate(self.channels):
             uid = f"mon_{channel['name']}_{idx}"
@@ -2649,11 +3949,7 @@ class App(ctk.CTk):
             elif "youtube.com" in url_lower or "youtu.be" in url_lower:
                 th = threading.Thread(target=workers.worker_youtube, args=(self, target), daemon=True)
             elif "withny.fun" in url_lower:
-                if channel["record"]:
-                    cid = workers.extract_withny_id(channel["url"])
-                    withny_record_targets[cid] = target
-                else:
-                    th = threading.Thread(target=workers.worker_withny_notify, args=(self, target), daemon=True)
+                th = threading.Thread(target=workers.worker_withny, args=(self, target), daemon=True)
             elif "live.fc2.com" in url_lower:
                 th = threading.Thread(target=workers.worker_fc2, args=(self, target), daemon=True)
                 
@@ -2661,16 +3957,22 @@ class App(ctk.CTk):
                 th.start()
                 self.monitor_threads.append(th)
                 
-        if withny_record_targets:
-            mth = threading.Thread(target=workers.worker_withny_master, args=(self, withny_record_targets), daemon=True)
-            mth.start()
-            self.monitor_threads.append(mth)
-            
         self.gui_update_queue.put(("refresh_channels_list", None))
 
     def stop_monitoring(self):
         self.is_monitoring = False
-        self.monitor_btn.configure(text="▶️ 啟動監控", fg_color=self.c_accent, hover_color=self.c_accent_hover)
+        
+        # Close Discord Gateway connection to log bot offline
+        if hasattr(self, "discord_ws") and self.discord_ws:
+            try:
+                self.discord_ws.close()
+            except:
+                pass
+            self.discord_ws = None
+            
+        self.monitor_btn.configure(text="▶️ 啟動全域監控", fg_color=self.c_accent, hover_color=self.c_accent_hover)
+        if hasattr(self, "sidebar_status_badge"):
+            self.sidebar_status_badge.configure(text="● 系統就緒 (待機中)", text_color=self.c_green_text)
         self.add_log("停止監控中，正在重置連線與子程序...", "WARNING")
         
         # Kill all active task processes
@@ -2696,26 +3998,168 @@ class App(ctk.CTk):
         self.gui_update_queue.put(("refresh_tasks", None))
         self.gui_update_queue.put(("refresh_channels_list", None))
 
-    def check_rplay_status(self, url):
-        import yt_dlp
-        ydl_opts = {
-            'extract_flat': True,
-            'skip_download': True,
-            'quiet': True,
-            'no_warnings': True,
-        }
-        if self.settings.get("rplay_username") and self.settings.get("rplay_password"):
-            ydl_opts['username'] = self.settings["rplay_username"]
-            ydl_opts['password'] = self.settings["rplay_password"]
-        else:
-            ydl_opts['extractor_args'] = {'rplaylive': {'jwt_token': [self.settings.get("rplay_token", "")]}}
+    def check_rplay_credentials_on_startup(self):
+        has_rplay = any("rplay.live" in c.get("url", "").lower() for c in self.channels)
+        if not has_rplay:
+            return
+            
+        rplay_token = self.settings.get("rplay_token", "").strip()
+        rplay_user_oid = self.settings.get("rplay_username", "").strip()
+        
+        if not rplay_token:
+            self.add_log("ℹ️ [啟動檢查] 未設定 Rplay Token，針對限定直播頻道可能無法錄製", "INFO")
+            return
+            
+        import base64
+        import json
+        import time
+        import requests
+        
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                data = ydl.extract_info(url, download=False)
-                if data and data.get('live_status') == 'is_live':
-                    return data
-        except:
+            parts = rplay_token.split('.')
+            payload = None
+            if len(parts) == 3:
+                p_b64 = parts[1] + '=' * (4 - len(parts[1]) % 4)
+                payload = json.loads(base64.b64decode(p_b64).decode('utf-8'))
+            elif len(parts) == 1:
+                p_b64 = rplay_token + '=' * (4 - len(rplay_token) % 4)
+                payload = json.loads(base64.b64decode(p_b64).decode('utf-8'))
+                
+            if payload and "exp" in payload:
+                exp_val = payload["exp"]
+                if time.time() > exp_val:
+                    exp_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(exp_val))
+                    self.add_log(f"🚨 [啟動檢查] Rplay Token 已於 {exp_str} 過期，請至設定更新！", "ERROR")
+                    return
+        except Exception:
             pass
+
+        if not rplay_user_oid:
+            try:
+                headers = {
+                    'User-Agent': self.settings.get("user_agent", "Mozilla/5.0"),
+                    'Referer': 'https://rplay.live/',
+                    'Origin': 'https://rplay.live',
+                    'Authorization': rplay_token
+                }
+                res = requests.get('https://api.rplay.live/account/getuser', headers=headers, timeout=5)
+                if res.status_code == 200:
+                    fetched_oid = res.json().get('_id') or res.json().get('id')
+                    if fetched_oid:
+                        rplay_user_oid = fetched_oid
+                        self.settings["rplay_username"] = fetched_oid
+                        self.save_settings()
+                        self.add_log(f"✅ [啟動檢查] 自動補全 Rplay User OID: {fetched_oid}", "SUCCESS")
+            except Exception:
+                pass
+                
+        if not rplay_user_oid:
+            self.add_log("⚠️ [啟動檢查] Rplay 已設定 Token 但缺少 User OID！", "WARNING")
+            return
+            
+        try:
+            headers = {
+                'User-Agent': self.settings.get("user_agent", "Mozilla/5.0"),
+                'Referer': 'https://rplay.live/',
+                'Origin': 'https://rplay.live',
+                'Authorization': rplay_token
+            }
+            key_url = f"https://api.rplay.live/live/key2?lang=en&requestorOid={rplay_user_oid}"
+            res = requests.get(key_url, headers=headers, timeout=5)
+            if res.status_code == 200:
+                res_json = res.json()
+                if res_json.get("region") == "japan" and not res_json.get("authKey"):
+                    self.add_log(f"⚠️ [啟動檢查] Rplay 授權異常: User OID ({rplay_user_oid}) 與 Token 不匹配或頻道被限制！", "WARNING")
+                else:
+                    self.add_log(f"✅ [啟動檢查] Rplay 登入授權狀態正常 (OID: {rplay_user_oid})", "SUCCESS")
+            elif res.status_code in (401, 403):
+                self.add_log(f"🚨 [啟動檢查] Rplay 登入授權失敗 (HTTP {res.status_code})，請更新 Rplay Token！", "ERROR")
+        except Exception as e:
+            self.add_log(f"⚠️ [啟動檢查] Rplay 驗證連線失敗: {e}", "WARNING")
+
+    def check_rplay_status(self, url):
+        import re
+        import requests
+        
+        headers = {
+            'User-Agent': self.settings.get("user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"),
+            'Referer': 'https://rplay.live/',
+            'Origin': 'https://rplay.live'
+        }
+        rplay_token = self.settings.get("rplay_token", "").strip()
+        if rplay_token:
+            headers['Authorization'] = rplay_token
+
+        # 1. Rplay 影片/錄播存檔 (VOD / Play Content)
+        m_play = re.search(r'https?://rplay\.live/(?:play|content|video)/(?P<id>[\d\w]+)', url)
+        if m_play:
+            content_id = m_play.group('id')
+            try:
+                from workers import get_rplay_butter_token
+                butter = get_rplay_butter_token()
+                c_headers = headers.copy()
+                if butter:
+                    c_headers['Butter'] = butter
+                params = {
+                    'contentOid': content_id,
+                    'status': 'published',
+                    'requestCanView': 'true'
+                }
+                rplay_user_oid = self.settings.get("rplay_username", "").strip()
+                if rplay_user_oid:
+                    params['requestorOid'] = rplay_user_oid
+                res = requests.get('https://api.rplay.live/content', params=params, headers=c_headers, timeout=10)
+                if res.status_code == 200:
+                    cdata = res.json()
+                    title = cdata.get('title', 'Rplay影片檔')
+                    return {
+                        'title': title,
+                        'live_status': 'vod',
+                        'is_live': False,
+                        'content_data': cdata
+                    }
+            except Exception as e:
+                self.add_log(f"Rplay 影片存檔查詢失敗 ({content_id}): {e}", "WARNING")
+            return None
+
+        # 2. Rplay 即時直播頻道 (Live Channel)
+        m = re.match(r'https?://rplay\.live/(?P<short>c|live)/(?P<id>[\d\w]+)', url)
+        if not m:
+            return None
+        short = m.group('short')
+        url_id = m.group('id')
+        creator_oid = url_id
+        
+        if short == 'c':
+            try:
+                res = requests.get(f'https://api.rplay.live/account/getuser?customUrl={url_id}', headers=headers, timeout=10)
+                if res.status_code == 200:
+                    creator_oid = res.json().get('_id')
+                else:
+                    return None
+            except Exception as e:
+                self.add_log(f"Rplay 解析帳號失敗 ({url_id}): {e}", "WARNING")
+                return None
+                
+        try:
+            res = requests.get(f'https://api.rplay.live/live/play?creatorOid={creator_oid}', headers=headers, timeout=10)
+            if res.status_code == 200:
+                live_info = res.json()
+                state = live_info.get('streamState')
+                if state == 'live':
+                    return {
+                        'title': live_info.get('title', '無標題'),
+                        'live_status': 'is_live',
+                        'is_live': True
+                    }
+                elif state in ('twitch', 'youtube'):
+                    # Ignore Twitch/YouTube redirects
+                    return None
+            elif res.status_code in (401, 403):
+                self.add_log(f"⚠️ Rplay 頻道查詢權限失敗 (HTTP {res.status_code})，請確認 Token 與 User OID 是否有效或已過期！", "WARNING")
+        except Exception as e:
+            self.add_log(f"Rplay 監控異常 ({url_id}): {e}", "WARNING")
+            
         return None
 
     def find_newest_downloaded_file_in_dir(self, output_dir, start_time):
@@ -2725,12 +4169,15 @@ class App(ctk.CTk):
         newest_file = None
         newest_mtime = 0
         
+        # Subtract a 120-second buffer to handle timing drift/file creation delays
+        threshold_time = start_time - 120
+        
         for root, dirs, files in os.walk(output_dir):
             for file in files:
                 file_path = os.path.join(root, file)
                 try:
                     mtime = os.path.getmtime(file_path)
-                    if mtime > start_time and mtime > newest_mtime:
+                    if mtime > threshold_time and mtime > newest_mtime:
                         # Exclude temporary intermediate TS files and temp mp4/mkv merge files
                         if not file.endswith(".part") and not file.endswith(".ytdl") and not file.endswith(".ts") and not file.endswith(".temp.mp4") and not file.endswith(".temp.mkv"):
                             newest_file = file_path

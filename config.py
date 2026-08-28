@@ -13,9 +13,10 @@ DEFAULT_SETTINGS = {
     "prevent_sleep_mode": "下載時不休眠",
     "rplay_token": "",
     "rplay_username": "",
-    "rplay_password": "",
     "withny_token": "",
-    "discord_webhook": "",
+    "discord_bot_token": "",
+    "discord_channel_id": "",
+    "discord_completed_channel_id": "",
     "cookies_file": "cookies.txt",
     "fc2_cookies_file": "fc2_cookies.txt",
     "yt_quality": "best",
@@ -33,5 +34,6 @@ DEFAULT_SETTINGS = {
     "fc2_format": "mp4",
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0",
     "max_concurrent_downloads": 2,
-    "rplay_version": "2025.02.26 (預估)"
+    "concurrent_fragments": 8,
+    "rplay_dl_version": "v2.3.1-vibe"
 }

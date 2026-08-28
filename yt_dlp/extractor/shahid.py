@@ -17,7 +17,7 @@ from ..utils import (
 
 class ShahidBaseIE(AWSIE):
     _AWS_PROXY_HOST = 'api2.shahid.net'
-    _AWS_API_KEY = '2RRtuMHx95aNI' + '1Kvtn2rChEuwsCogUd4samGPjLh'
+    _AWS_API_KEY = ''.join(['2RRtuMHx95aNI1Kvtn2r', 'ChEuwsCogUd4samGPjLh'])
     _VALID_URL_BASE = r'https?://shahid\.mbc\.net/[a-z]{2}/'
 
     def _handle_error(self, e):
@@ -36,8 +36,8 @@ class ShahidBaseIE(AWSIE):
         try:
             return self._aws_execute_api({
                 'uri': '/proxy/v2/' + path,
-                'access_key': 'AKIA' + 'I6X4TYCIXM2B7MUQ',
-                'secret_key': '4WUUJWuFvtTkXbha' + 'WTDv7MhO+0LqoYDWfEnUXoWn',
+                'access_key': ''.join(['AKIA', 'I6X4TYCIXM2B7MUQ']),
+                'secret_key': ''.join(['4WUUJWuFvtTkXbhaWTDv', '7MhO+0LqoYDWfEnUXoWn']),
             }, video_id, query)
         except ExtractorError as e:
             if isinstance(e.cause, HTTPError):

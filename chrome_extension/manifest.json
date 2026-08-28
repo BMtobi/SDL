@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "StreamBot Token 自動同步器",
+  "version": "1.3.0",
+  "description": "原生自動擷取與同步 Withny 及 Rplay 的 Session Token 至 StreamBot 本機服務",
+  "permissions": [
+    "cookies",
+    "storage",
+    "alarms",
+    "scripting",
+    "activeTab",
+    "tabs"
+  ],
+  "host_permissions": [
+    "*://*.withny.fun/*",
+    "*://*.rplay.live/*",
+    "http://127.0.0.1:18730/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.rplay.live/*"],
+      "js": ["content_rplay.js"],
+      "run_at": "document_end"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "StreamBot Token 同步器"
+  }
+}
